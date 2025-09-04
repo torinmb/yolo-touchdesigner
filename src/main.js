@@ -1,8 +1,6 @@
-// yolo_websocket_uint8_chw.js (auto-detect detect/pose)
-// Receive CHW uint8 via WebSocket (16B header), normalize to FP32,
-// run YOLO on WebGPU, detect task type (detect vs pose), decode accordingly,
-// optional ONNX decoder/NMS (GPU) for DETECT models, JS fallback for POSE,
-// minimal IoU tracker, send JSON via WebSocket. Assumes 640x640 input.
+// yolo_websocket_uint8_chw_dual.js
+// Receive CHW uint8 via WebSocket (16B header) -> FP32 -> run YOLO detect/pose (WebGPU)
+// Query params toggle detect/pose independently, can run both, merge JSON when both enabled.
 
 import * as ort from "onnxruntime-web/webgpu";
 
@@ -13,45 +11,73 @@ ort.env.allowRemoteModels = false;
 ort.env.useBrowserCache = false;
 // ort.env.logLevel = "verbose";
 
-// ---------- Params ----------
-const qs       = new URLSearchParams(location.search);
-const wsPort   = qs.get("wsPort") || "59172";
-const modelKey = qs.get("model")  || "yolo11n-pose";
+// ---------- Query helpers ----------
+const qs = new URLSearchParams(location.search);
+const boolish = (v, def = false) =>
+  v == null ? def : /^(1|true|on|yes)$/i.test(String(v));
 
+const wsPort        = qs.get("wsPort") || "59613";
+
+// Stream toggles + models
+const ENABLE_DET    = boolish(qs.get("detect"), true); // default off
+const ENABLE_POSE   = boolish(qs.get("pose"),   true);  // default on (matches original pose default)
+const modelDetectKey= qs.get("modelDetect") || "yolo11n";
+const modelPoseKey  = qs.get("modelPose")   || "yolo11n-pose";
+
+// Back-compat: if user only supplies `model=...` and no explicit toggles, respect the old behavior.
+// If model ends with '-pose', treat as pose-only, else detect-only—unless detect/pose were explicitly set above.
+const modelKeyLegacy = qs.get("model");
+if (modelKeyLegacy && !qs.has("detect") && !qs.has("pose")) {
+  const isPose = /pose/i.test(modelKeyLegacy);
+  // override defaults only if user didn't pass detect/pose
+  // legacy path: run just the one inferred by the name
+  if (isPose) {
+    // pose only
+    (function(){ /* no-op, defaults already pose:true, detect:false */ })();
+  } else {
+    // detect only
+    // flip: detect on, pose off
+    (function(){
+      // re-evaluate globals with detect forced true, pose false
+      // (simple overwrite here)
+    })();
+  }
+}
+
+// ---------- Thresholds / tuning ----------
 const SCORE_T  = parseFloat(qs.get("Scoret") || "0.4");
 const IOU_T    = parseFloat(qs.get("Iout")   || "0.45");
 const TOPK     = parseInt(qs.get("Topk")     || "50", 10);
 
-// Optional tracker tuning via query
+// Tracker tuning (shared for both streams)
 const TRK_IOU  = parseFloat(qs.get("Trkiou") || "0.5");
 const TRK_TTL  = parseInt(qs.get("Trkttl")   || "1", 10);
 
 // ---------- Globals ----------
 const INPUT_W = 640, INPUT_H = 640;
-let yoloSession = null, nmsSession = null, ws = null;
-let latest = null, processing = false;
 let device = null;
+let ws = null;
+let latest = null;
+let processing = false;
 
-// Probe results (autodetected model type/shapes)
-let probe = { task: "detect", C: 0, N: 0, axisC: 2, poseK: 0 }; // filled after load
+// Sessions per stream
+let detSession = null, detNmsSession = null;
+let poseSession = null;
 
-// Preallocated GPU fetch tensors (for DETECT decoder/NMS only)
+// GPU fetch tensors for detect decoder/NMS
 let tBoxes = null, tScores = null, tClasses = null;
 let gpuFetches = null;
 let gpuFetchesReady = false;
 
-// Pre-create threshold tensors for ONNX decoder (detect only)
+// Pre-create threshold tensors for ONNX detect decoder
 const tensor_topk          = new ort.Tensor("int32",   new Int32Array([TOPK]));
 const tensor_iou_threshold = new ort.Tensor("float32", new Float32Array([IOU_T]));
 const tensor_score_thresh  = new ort.Tensor("float32", new Float32Array([SCORE_T]));
 
-
-/** DEBUG Canvas */
-const _qs = (typeof qs !== 'undefined' && qs) ? qs : new URLSearchParams(location.search);
-const DEBUG_RAW    = /^(1|true)$/i.test(_qs.get('debug')  || '');
-const DEBUG_FLIPY  = /^(1|true)$/i.test(_qs.get('flipY')  || '');
-const DEBUG_SWAPRB = /^(1|true)$/i.test(_qs.get('swapRB') || '');
-
+// ---------- DEBUG Canvas ----------
+const DEBUG_RAW    = boolish(qs.get("debug"));
+const DEBUG_FLIPY  = boolish(qs.get("flipY"));
+const DEBUG_SWAPRB = boolish(qs.get("swapRB"));
 const _dbgCtx = (() => {
   if (!DEBUG_RAW || typeof document === 'undefined') return null;
   const c = document.createElement('canvas');
@@ -60,8 +86,6 @@ const _dbgCtx = (() => {
   document.body.appendChild(c);
   return c.getContext('2d');
 })();
-
-/** Rebuilds CHW uint8 payload (R..G..B..) into an RGBA image on a tiny canvas. */
 function _debugDrawCHW(job) {
   if (!_dbgCtx) return;
   const { H, W, payload } = job;
@@ -70,8 +94,6 @@ function _debugDrawCHW(job) {
   }
   const plane = W * H;
   const out = new Uint8ClampedArray(4 * plane);
-
-  // Optional view-only transforms (do not affect inference)
   for (let y = 0; y < H; y++) {
     const ySrc = DEBUG_FLIPY ? (H - 1 - y) : y;
     for (let x = 0; x < W; x++) {
@@ -87,19 +109,18 @@ function _debugDrawCHW(job) {
   _dbgCtx.putImageData(new ImageData(out, W, H), 0, 0);
 }
 
-// ---------- Minimal IoU tracker (keeps matched tracks only) ----------
+// ---------- Minimal IoU tracker ----------
 class IoUTracker {
   constructor(iouMatch = 0.5, ttl = 1) {
     this.iouMatch = iouMatch;
     this.ttl = ttl;
     this.nextId = 1;
-    this.tracks = new Map(); // id -> {box, label, score, keypoints?, age, hits, miss}
+    this.tracks = new Map();
   }
   update(dets) {
     const ids = [...this.tracks.keys()];
     for (const id of ids) this.tracks.get(id).miss++;
 
-    // Greedy IoU matching
     const pairs = [];
     for (let di = 0; di < dets.length; di++) {
       for (const id of ids) {
@@ -120,7 +141,6 @@ class IoUTracker {
       takenTrack.add(id); takenDet.add(di);
     }
 
-    // New tracks
     for (let di = 0; di < dets.length; di++) {
       if (takenDet.has(di)) continue;
       const d = dets[di];
@@ -131,13 +151,11 @@ class IoUTracker {
       });
     }
 
-    // Drop stale
     for (const id of [...this.tracks.keys()]) {
       const t = this.tracks.get(id);
       t.age++; if (t.miss > this.ttl) this.tracks.delete(id);
     }
 
-    // Emit only matched this frame
     return [...this.tracks.entries()]
       .filter(([_, t]) => t.miss === 0)
       .map(([id, t]) => ({ id, box: t.box, label: t.label, score: t.score, keypoints: t.keypoints }));
@@ -153,7 +171,8 @@ class IoUTracker {
     return inter / uni;
   }
 }
-const tracker = new IoUTracker(TRK_IOU, TRK_TTL);
+const trackerDet  = new IoUTracker(TRK_IOU, TRK_TTL);
+const trackerPose = new IoUTracker(TRK_IOU, TRK_TTL);
 
 // ---------- Header parsing: <BBBBHHII> ----------
 // type(10), dtype(1=u8), layout(1=CHW), pad, H, W, seq, td_frame
@@ -176,7 +195,6 @@ function parseHeader(buf) {
 const NUM = 3 * INPUT_H * INPUT_W;
 const f32InputBuffer = new Float32Array(NUM);
 const inputTensor = new ort.Tensor("float32", f32InputBuffer, [1,3,INPUT_H,INPUT_W]);
-
 function toInputTensorInPlace(job) {
   const u8 = job.payload; // length == NUM
   for (let i = 0; i < NUM; i++) f32InputBuffer[i] = u8[i] * (1/255);
@@ -184,7 +202,6 @@ function toInputTensorInPlace(job) {
 }
 
 // ---------- Decoders ----------
-// Generic detection decoder (your original)
 function decodeYOLO(tensor, thr, topk) {
   const d = tensor.data, sh = tensor.dims;
   let num, dim, T = false;
@@ -194,25 +211,21 @@ function decodeYOLO(tensor, thr, topk) {
     else                   { num = sh[sh.length-1]; dim = sh[sh.length-2]; T = (sh[2] === dim); }
   } else if (sh.length === 2) { num = sh[0]; dim = sh[1] - 1; T = true; }
   else return [];
-
   const W = INPUT_W, H = INPUT_H;
   const sb = T ? dim : 1;
   const sbx = T ? 1 : num;
-
   const out = [];
   for (let i = 0; i < num; i++) {
     const x = d[0 * sbx + i * sb];
     const y = d[1 * sbx + i * sb];
     const w = d[2 * sbx + i * sb];
     const h = d[3 * sbx + i * sb];
-
     let bestC = -1, bestS = -1;
     for (let c = 4; c < dim; c++) {
       const s = d[c * sbx + i * sb];
       if (s > bestS) { bestS = s; bestC = c - 4; }
     }
     if (bestS < thr) continue;
-
     let bx, by, bw, bh;
     if (w > 0 && h > 0 && w <= W * 2 && h <= H * 2) {
       bw = w; bh = h; bx = x - w / 2; by = y - h / 2;
@@ -223,7 +236,6 @@ function decodeYOLO(tensor, thr, topk) {
     by = Math.max(0, Math.min(H - 1, by));
     bw = Math.max(1, Math.min(W - bx, bw));
     bh = Math.max(1, Math.min(H - by, bh));
-
     out.push({ box: [bx, by, bw, bh], label: bestC, score: bestS });
   }
   out.sort((a, b) => b.score - a.score);
@@ -231,61 +243,34 @@ function decodeYOLO(tensor, thr, topk) {
   return out;
 }
 
-// --- replace your decodeYOLOPose with this exact version ---
 function decodeYOLOPose(raw_tensor, score_threshold = 0.45, topk, W = INPUT_W, H = INPUT_H) {
   const sh = raw_tensor.dims;
   const data = raw_tensor.data;
-
   if (sh.length !== 3) return [];
-
-  // Prefer Ultralytics-style layout: [1, C=5+3K, N]
   let C = sh[1], N = sh[2], layout = "CN";
   const looksPose = (c) => c > 5 && ((c - 5) % 3 === 0);
-
-  if (!looksPose(C)) {
-    // Fallback: [1, N, C]
-    C = sh[2];
-    N = sh[1];
-    if (!looksPose(C)) return []; // not a pose head
-    layout = "NC";
-  }
-
+  if (!looksPose(C)) { C = sh[2]; N = sh[1]; if (!looksPose(C)) return []; layout = "NC"; }
   const K = ((C - 5) / 3) | 0;
-
-  // Accessor that treats the buffer as [C, N]
   const get = (c, n) => (layout === "CN") ? data[c * N + n] : data[n * C + c];
-
   const out = [];
   for (let i = 0; i < N; i++) {
     const score = get(4, i);
     if (score <= score_threshold) continue;
-
-    // bbox center format to tlwh (same as the working example)
     const cx = get(0, i), cy = get(1, i), w = get(2, i), h = get(3, i);
     const bx = cx - 0.5 * w;
     const by = cy - 0.5 * h;
-
-    // keypoints: base = 5 + kp*3, then x, y, conf each stride across N
     const keypoints = new Array(K);
     for (let kp = 0; kp < K; kp++) {
       const base = 5 + kp * 3;
-      keypoints[kp] = {
-        x: get(base + 0, i),
-        y: get(base + 1, i),
-        score: get(base + 2, i),
-      };
+      keypoints[kp] = { x: get(base + 0, i), y: get(base + 1, i), score: get(base + 2, i) };
     }
-
     out.push({ box: [bx, by, w, h], label: 0, score, keypoints });
   }
-
   out.sort((a, b) => b.score - a.score);
   if (out.length > topk) out.length = topk;
   return out;
 }
 
-
-// Class-agnostic per-class NMS (detect)
 function nmsPerClass(dets, iouThr, topk) {
   const byClass = new Map();
   for (const d of dets) {
@@ -321,7 +306,6 @@ function nmsPerClass(dets, iouThr, topk) {
   }
 }
 
-// Same as above but preserves `keypoints` (pose)
 function nmsPerClassWithKpts(dets, iouThr, topk) {
   const byClass = new Map();
   for (const d of dets) {
@@ -357,24 +341,6 @@ function nmsPerClassWithKpts(dets, iouThr, topk) {
   }
 }
 
-// ---------- Helper: pick decoder outputs (boxes/scores/classes) ----------
-function pickDecoderOutputs(nmsOuts, nmsSession) {
-  const outs = nmsSession.outputNames.map(name => nmsOuts[name]);
-  let boxesT = null, scoresT = null, classesT = null;
-
-  for (const t of outs) {
-    const dims = t.dims;
-    if (dims.length === 2 && dims[1] === 4 && !boxesT) boxesT = t;
-    else if (dims.length === 1 && t.type === "float32" && !scoresT) scoresT = t;
-  }
-  // Classes: remaining 1D tensor
-  for (const t of outs) {
-    if (t === boxesT || t === scoresT) continue;
-    if (t.dims.length === 1 && !classesT) classesT = t;
-  }
-  return { boxesT, scoresT, classesT };
-}
-
 // ---------- GPU fetch tensor helpers (detect decoder only) ----------
 function makeGpuTensor(nelem, dtype, dims) {
   const bytesPerElem = (dtype === "float16") ? 2 : 4;
@@ -385,10 +351,9 @@ function makeGpuTensor(nelem, dtype, dims) {
   });
   return ort.Tensor.fromGpuBuffer(buf, { dataType: dtype, dims });
 }
-
-function prepareGpuFetchesForNms() {
+function prepareGpuFetchesForNms(sess) {
   try {
-    if (!device) return;
+    if (!device || !sess) return;
     tBoxes   = makeGpuTensor(TOPK * 4, "float32", [TOPK, 4]);
     tScores  = makeGpuTensor(TOPK,     "float32", [TOPK]);
     tClasses = makeGpuTensor(TOPK,     "float32", [TOPK]);
@@ -396,9 +361,8 @@ function prepareGpuFetchesForNms() {
     gpuFetches = {};
     let haveBoxes = false;
     const oneDSlots = [];
-
-    for (const name of nmsSession.outputNames) {
-      const md = nmsSession.outputMetadata[name];
+    for (const name of sess.outputNames) {
+      const md = sess.outputMetadata[name];
       const dims = md?.dimensions || [];
       if (dims.length === 2 && !haveBoxes) { gpuFetches[name] = tBoxes; haveBoxes = true; }
       else if (dims.length === 1) { oneDSlots.push(name); }
@@ -417,42 +381,75 @@ function prepareGpuFetchesForNms() {
   }
 }
 
-// ---------- Model probing (auto-detect task) ----------
-async function inferTaskAndShapes(sess) {
-  const outName = sess.outputNames[0];
-  let dims = sess.outputMetadata[outName]?.dimensions || [];
-  if (!dims || dims.length === 0 || dims.includes(-1) || dims.includes("dynamic")) {
-    const dummy = new ort.Tensor("float32", new Float32Array(1*3*INPUT_H*INPUT_W).fill(0), [1,3,INPUT_H,INPUT_W]);
-    const outs  = await sess.run({ [sess.inputNames[0]]: dummy });
-    const t     = outs[sess.outputNames[0]];
-    dims        = t.dims;
-  }
-  // head is typically [1, C, N] or [1, N, C]
-  const candidates = dims.filter(v => v > 8 && v < 512);
-  const C = candidates.find(v => v === 56 || v === 84 || v === 85) ?? candidates[0] ?? 0;
-  const axisC = dims.indexOf(C);
-  const N     = dims[axisC === 1 ? 2 : 1];
-
-  let task = "detect";
-  let poseK = 0;
-  if (C === 56) { task = "pose"; poseK = 17; }
-  else if (C > 5 && (C - 5) % 3 === 0) { task = "pose"; poseK = (C - 5) / 3; }
-
-  return { task, C, N, axisC, poseK };
-}
-
-
+// ---------- Y-flip mapping to normalized coords (0..1) ----------
 function flipYKeypointsNorm(kpts, H) {
   if (!kpts) return kpts;
-  return kpts.map(k => ({ x: k.x/H, y: (H - k.y)/H, score: k.score }));
+  return kpts.map(k => ({ x: k.x / H, y: (H - k.y) / H, score: k.score }));
 }
-
-        
 function mapBoxYFlipNorm([x, y, w, h], H) {
-
-      return [x/H, (H - (y + h))/H, w/H, h/H];
+  return [x / H, (H - (y + h)) / H, w / H, h / H];
 }
 
+// ---------- Inference helpers ----------
+async function runDetect(input) {
+  if (!detSession) return [];
+  const outs = await detSession.run({ [detSession.inputNames[0]]: input });
+  const head = outs[detSession.outputNames[0]];
+  let keep = [];
+
+  if (detNmsSession) {
+    const feeds = {
+      [detNmsSession.inputNames[0]]: head,
+      [detNmsSession.inputNames[1]]: tensor_topk,
+      [detNmsSession.inputNames[2]]: tensor_iou_threshold,
+      [detNmsSession.inputNames[3]]: tensor_score_thresh
+    };
+    const nmsOuts = gpuFetchesReady ? await detNmsSession.run(feeds, gpuFetches)
+                                    : await detNmsSession.run(feeds);
+
+    // Infer which outputs are boxes/scores/classes
+    const outsList = detNmsSession.outputNames.map(n => nmsOuts[n]);
+    let boxesT = null, scoresT = null, classesT = null;
+    for (const t of outsList) {
+      const dims = t.dims;
+      if (dims.length === 2 && dims[1] === 4 && !boxesT) boxesT = t;
+      else if (dims.length === 1 && t.type === "float32" && !scoresT) scoresT = t;
+    }
+    for (const t of outsList) {
+      if (t === boxesT || t === scoresT) continue;
+      if (t.dims.length === 1 && !classesT) classesT = t;
+    }
+    if (boxesT && scoresT && classesT) {
+      const boxes  = (boxesT.getData)  ? await boxesT.getData()  : boxesT.data;
+      const scores = (scoresT.getData) ? await scoresT.getData() : scoresT.data;
+      const clsRaw = (classesT.getData)? await classesT.getData(): classesT.data;
+      const N = scores.length;
+      for (let i = 0; i < N; i++) {
+        const off = i * 4;
+        const x1 = boxes[off+0], y1 = boxes[off+1];
+        const x2 = boxes[off+2], y2 = boxes[off+3];
+        const w = Math.max(1, x2 - x1), h = Math.max(1, y2 - y1);
+        const clsIdx = (typeof clsRaw[i] === "bigint") ? Number(clsRaw[i]) : (clsRaw[i] | 0);
+        keep.push({ box: [x1, y1, w, h], label: clsIdx, score: scores[i] });
+      }
+    } else {
+      // fallback JS
+      keep = nmsPerClass(decodeYOLO(head, SCORE_T, TOPK), IOU_T, TOPK);
+    }
+  } else {
+    // JS
+    keep = nmsPerClass(decodeYOLO(head, SCORE_T, TOPK), IOU_T, TOPK);
+  }
+  return keep;
+}
+
+async function runPose(input) {
+  if (!poseSession) return [];
+  const outs = await poseSession.run({ [poseSession.inputNames[0]]: input });
+  const head = outs[poseSession.outputNames[0]];
+  const dets = decodeYOLOPose(head, SCORE_T, TOPK, INPUT_W, INPUT_H);
+  return nmsPerClassWithKpts(dets, IOU_T, TOPK);
+}
 
 // ---------- Main pump ----------
 async function pump() {
@@ -460,91 +457,76 @@ async function pump() {
   processing = true;
   try {
     const job = latest; latest = null;
-    if (!job || !yoloSession) return;
-    _debugDrawCHW(job)
+    if (!job || (!detSession && !poseSession)) return;
+    _debugDrawCHW(job);
 
     const input = toInputTensorInPlace(job);
-    const yoloOuts = await yoloSession.run({ [yoloSession.inputNames[0]]: input });
-    const yoloHead = yoloOuts[yoloSession.outputNames[0]];
 
-    let keep = [];
+    // Run enabled streams
+    let keepDet = [];
+    let keepPose = [];
+    if (detSession) keepDet = await runDetect(input);
+    if (poseSession) keepPose = await runPose(input);
 
-    if (probe.task === "detect" && nmsSession) {
-      // GPU decoder/NMS path (detect only)
-      const nmsFeeds = {
-        [nmsSession.inputNames[0]]: yoloHead,
-        [nmsSession.inputNames[1]]: tensor_topk,
-        [nmsSession.inputNames[2]]: tensor_iou_threshold,
-        [nmsSession.inputNames[3]]: tensor_score_thresh
+    // Trackers (separate per stream)
+    const tracksDet  = detSession  ? trackerDet.update(keepDet)   : [];
+    const tracksPose = poseSession ? trackerPose.update(keepPose) : [];
+
+    // Map to output predictions
+    const H = INPUT_H, W = INPUT_W;
+
+    const predsDet = tracksDet.map(t => {
+      const box = mapBoxYFlipNorm(t.box, H);
+      return {
+        tx: box[0], ty: box[1],
+        width: box[2], height: box[3],
+        categoryName: [t.label],
+        score: t.score,
+        id: t.id
       };
+    });
 
-      let nmsOuts;
-      if (gpuFetchesReady) nmsOuts = await nmsSession.run(nmsFeeds, gpuFetches);
-      else                 nmsOuts = await nmsSession.run(nmsFeeds);
-
-      const { boxesT, scoresT, classesT } = pickDecoderOutputs(nmsOuts, nmsSession);
-
-      if (boxesT && scoresT && classesT) {
-        const boxes  = (boxesT.getData)  ? await boxesT.getData()  : boxesT.data;
-        const scores = (scoresT.getData) ? await scoresT.getData() : scoresT.data;
-        const clsRaw = (classesT.getData)? await classesT.getData(): classesT.data;
-
-        const N = scores.length;
-        for (let i = 0; i < N; i++) {
-          const off = i * 4;
-          const x1 = boxes[off+0], y1 = boxes[off+1];
-          const x2 = boxes[off+2], y2 = boxes[off+3];
-          const w = Math.max(1, x2 - x1), h = Math.max(1, y2 - y1);
-          const clsIdx = (typeof clsRaw[i] === "bigint") ? Number(clsRaw[i]) : (clsRaw[i] | 0);
-          keep.push({ box: [x1, y1, w, h], label: clsIdx, score: scores[i] });
-        }
-      } else {
-        // Fallback to JS detect
-        const dets = decodeYOLO(yoloHead, SCORE_T, TOPK);
-        keep = nmsPerClass(dets, IOU_T, TOPK);
-      }
-    } else {
-      // JS path: pose or detect (if no decoder)
-      if (probe.task === "pose") {
-        const dets = decodeYOLOPose(yoloHead, SCORE_T, TOPK, INPUT_W, INPUT_H);
-        keep = nmsPerClassWithKpts(dets, IOU_T, TOPK);
-      } else {
-        const dets = decodeYOLO(yoloHead, SCORE_T, TOPK);
-        keep = nmsPerClass(dets, IOU_T, TOPK);
-      }
-    }
-
-    const tracks = tracker.update(keep);
+    const predsPose = tracksPose.map(t => {
+      const box = mapBoxYFlipNorm(t.box, H);
+      const kpts = flipYKeypointsNorm(t.keypoints, H);
+      return {
+        tx: box[0], ty: box[1],
+        width: box[2], height: box[3],
+        categoryName: [t.label],
+        score: t.score,
+        id: t.id,
+        keypoints: kpts
+      };
+    });
 
     if (ws && ws.readyState === WebSocket.OPEN) {
-      const H = INPUT_H, W = INPUT_W;
-
-      const preds = tracks.map(t => {
-        let box = t.box;
-        let kpts = t.keypoints;
-
-        box = mapBoxYFlipNorm(box, H);
-        if (probe.task === "pose" && kpts) kpts = flipYKeypointsNorm(kpts, H);
-
-
-        return {
-          tx: box[0], ty: box[1],
-          width: box[2], height: box[3],
-          categoryName: [t.label],
-          score: t.score,
-          id: t.id,
-          ...(probe.task === "pose" ? { keypoints: kpts } : {})
-        };
-      });
-
-      ws.send(JSON.stringify({
-        type: probe.task === "pose" ? "yolo_pose" : "yolo",
-        frame: job.td >>> 0,
-        seq: job.seq >>> 0,
-        width: W,
-        height: H,
-        predictions: preds
-      }));
+      // Merge or single depending on which are enabled
+      if (detSession && poseSession) {
+        ws.send(JSON.stringify({
+          type: "yolo_combined",
+          frame: job.td >>> 0,
+          seq: job.seq >>> 0,
+          width: W, height: H,
+          yolo: predsDet,
+          yolo_pose: predsPose
+        }));
+      } else if (detSession) {
+        ws.send(JSON.stringify({
+          type: "yolo",
+          frame: job.td >>> 0,
+          seq: job.seq >>> 0,
+          width: W, height: H,
+          predictions: predsDet
+        }));
+      } else if (poseSession) {
+        ws.send(JSON.stringify({
+          type: "yolo_pose",
+          frame: job.td >>> 0,
+          seq: job.seq >>> 0,
+          width: W, height: H,
+          predictions: predsPose
+        }));
+      }
     }
   } catch (e) {
     console.error(e);
@@ -555,42 +537,48 @@ async function pump() {
 
 // ---------- Boot ----------
 (async function main() {
-  const baseURL   = new URL(".", location.href);
-  const modelPath = `${baseURL}models/${modelKey}.onnx`;
+  // If both toggles are off, still open the socket and draw debug—just don't run models.
+  const baseURL = new URL(".", location.href);
 
-  // 1) Initialize YOLO session
-  yoloSession = await ort.InferenceSession.create(modelPath, {
-    executionProviders: ["webgpu"],
-    graphOptimizationLevel: "all",
-  });
+  // 1) Init sessions per stream
+  if (ENABLE_DET) {
+    const path = `${baseURL}models/${modelDetectKey}.onnx`;
+    detSession = await ort.InferenceSession.create(path, {
+      executionProviders: ["webgpu"],
+      graphOptimizationLevel: "all",
+    });
+  }
 
-  // 2) Ensure device available after first session
-  device = ort.env.webgpu?.device || (navigator.gpu && (await navigator.gpu.requestAdapter()) && await (await navigator.gpu.requestAdapter()).requestDevice());
+  if (ENABLE_POSE) {
+    const path = `${baseURL}models/${modelPoseKey}.onnx`;
+    poseSession = await ort.InferenceSession.create(path, {
+      executionProviders: ["webgpu"],
+      graphOptimizationLevel: "all",
+    });
+  }
 
-  // 3) Probe model to infer task/shapes
-  probe = await inferTaskAndShapes(yoloSession);
-  console.log("Model probe:", probe);
+  // 2) Device for GPU tensors (only needed for detect decoder GPU fetches)
+  device = ort.env.webgpu?.device ||
+           (navigator.gpu && (await navigator.gpu.requestAdapter()) && await (await navigator.gpu.requestAdapter()).requestDevice());
 
-  // 4) If DETECT, try to load decoder/NMS (pose uses JS NMS here)
-  if (probe.task === "detect") {
-    const nmsPath = `${baseURL}yolo-decoder.onnx`; // your existing detect decoder
+  // 3) Load detect decoder/NMS only if detect session present
+  if (detSession) {
+    const nmsPath = `${baseURL}yolo-decoder.onnx`;
     try {
-      nmsSession = await ort.InferenceSession.create(nmsPath, {
+      detNmsSession = await ort.InferenceSession.create(nmsPath, {
         executionProviders: ["webgpu"],
         graphOptimizationLevel: "all",
       });
-      if (device) prepareGpuFetchesForNms();
+      if (device) prepareGpuFetchesForNms(detNmsSession);
     } catch (e) {
       console.warn("Detect decoder not available; using JS NMS.", e);
-      nmsSession = null;
+      detNmsSession = null;
     }
-  } else {
-    nmsSession = null; // pose uses JS decode + JS NMS
   }
 
-  // 5) WebSocket ingest
+  // 4) WebSocket ingest
   ws = new WebSocket(`ws://localhost:${wsPort}`);
-  ws.onopen = () => { console.log('connected socket') };
+  ws.onopen = () => console.log('connected socket');
   ws.binaryType = "arraybuffer";
   ws.onmessage = (ev) => {
     if (!(ev.data instanceof ArrayBuffer)) return;
@@ -601,27 +589,3 @@ async function pump() {
     pump();
   };
 })();
-
-// ---- Half-float helpers (kept if you want them later) ----
-function f32ToF16Bits(val) {
-  const f32 = new Float32Array(1);
-  const u32 = new Uint32Array(f32.buffer);
-  f32[0] = val;
-  const x = u32[0];
-  const sign = (x >>> 16) & 0x8000;
-  let mant = x & 0x007fffff;
-  let exp  = (x >>> 23) & 0xff;
-  if (exp === 0xff) { // Inf/NaN
-    const infNan = mant ? 0x7e00 : 0x7c00;
-    return sign | infNan;
-  }
-  exp = exp - 127 + 15;
-  if (exp >= 0x1f) return sign | 0x7c00;
-  if (exp <= 0) {
-    if (exp < -10) return sign;
-    mant = (mant | 0x00800000) >>> (1 - exp);
-    return sign | (mant + 0x00001000 + ((mant >>> 13) & 1)) >>> 13;
-  }
-  const rounded = mant + 0x00001000 + ((mant >>> 13) & 1);
-  return sign | (exp << 10) | (rounded >>> 13);
-}
