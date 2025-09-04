@@ -16,42 +16,93 @@ const qs = new URLSearchParams(location.search);
 const boolish = (v, def = false) =>
   v == null ? def : /^(1|true|on|yes)$/i.test(String(v));
 
-const wsPort        = qs.get("wsPort") || "59613";
+const pick = (...names) => {
+  for (const n of names) if (n && qs.has(n)) return qs.get(n);
+  return null;
+};
+const getStr = (names, fallback) => {
+  const v = pick(...names);
+  return v != null ? v : fallback;
+};
+const getBool = (names, fallback) => {
+  const v = pick(...names);
+  return v != null ? boolish(v, fallback) : fallback;
+};
+const getNum = (primaryNames, fallback, commonFallbackName) => {
+  for (const n of primaryNames) {
+    if (qs.has(n)) {
+      const x = parseFloat(qs.get(n));
+      if (!Number.isNaN(x)) return x;
+    }
+  }
+  if (commonFallbackName && qs.has(commonFallbackName)) {
+    const x = parseFloat(qs.get(commonFallbackName));
+    if (!Number.isNaN(x)) return x;
+  }
+  return fallback;
+};
+const getInt = (primaryNames, fallback, commonFallbackName) => {
+  for (const n of primaryNames) {
+    if (qs.has(n)) {
+      const x = parseInt(qs.get(n), 10);
+      if (!Number.isNaN(x)) return x;
+    }
+  }
+  if (commonFallbackName && qs.has(commonFallbackName)) {
+    const x = parseInt(qs.get(commonFallbackName), 10);
+    if (!Number.isNaN(x)) return x;
+  }
+  return fallback;
+};
 
-// Stream toggles + models
-const ENABLE_DET    = boolish(qs.get("detect"), true); // default off
-const ENABLE_POSE   = boolish(qs.get("pose"),   true);  // default on (matches original pose default)
-const modelDetectKey= qs.get("modelDetect") || "yolo11n";
-const modelPoseKey  = qs.get("modelPose")   || "yolo11n-pose";
+const wsPort = qs.get("wsPort") || "62309";
 
-// Back-compat: if user only supplies `model=...` and no explicit toggles, respect the old behavior.
-// If model ends with '-pose', treat as pose-only, else detect-only—unless detect/pose were explicitly set above.
-const modelKeyLegacy = qs.get("model");
-if (modelKeyLegacy && !qs.has("detect") && !qs.has("pose")) {
-  const isPose = /pose/i.test(modelKeyLegacy);
-  // override defaults only if user didn't pass detect/pose
-  // legacy path: run just the one inferred by the name
-  if (isPose) {
-    // pose only
-    (function(){ /* no-op, defaults already pose:true, detect:false */ })();
+// ---------- Stream toggles + models (with aliases/typos/legacy) ----------
+let ENABLE_DET = getBool(
+  ["Objecttrackingenabled", "detect"],
+  true
+);
+let ENABLE_POSE = getBool(["Posetrackingenabled", "pose"], true);
+
+let modelDetectKey = getStr(
+  ["Obecttrackingmodel", "modelDetect"],
+  "yolo11n"
+);
+let modelPoseKey = getStr(["Posemodel", "modelPose"], "yolo11n-pose");
+
+// Legacy single `model=` inference, only if no explicit toggles were provided anywhere.
+const legacyModel = qs.get("model");
+const anyToggleProvided =
+  ["Poseenabled", "pose", "Objecttrackingenabled", "detect"]
+    .some((k) => qs.has(k));
+if (legacyModel && !anyToggleProvided) {
+  if (/pose/i.test(legacyModel)) {
+    ENABLE_POSE = true;
+    ENABLE_DET = false;
+    modelPoseKey = legacyModel;
   } else {
-    // detect only
-    // flip: detect on, pose off
-    (function(){
-      // re-evaluate globals with detect forced true, pose false
-      // (simple overwrite here)
-    })();
+    ENABLE_DET = true;
+    ENABLE_POSE = false;
+    modelDetectKey = legacyModel;
   }
 }
 
-// ---------- Thresholds / tuning ----------
-const SCORE_T  = parseFloat(qs.get("Scoret") || "0.4");
-const IOU_T    = parseFloat(qs.get("Iout")   || "0.45");
-const TOPK     = parseInt(qs.get("Topk")     || "50", 10);
+// ---------- Per-task thresholds / tuning (with back-compat fallbacks) ----------
+// Detect (objects)
+const DET_SCORE_T = getNum(["Detscoret"], 0.40, "Scoret");   // score conf
+const DET_IOU_T   = getNum(["Detiout"],    0.45, "Iout");     // NMS IoU
+const DET_TOPK    = getInt(["Dettopk"],   100,  "Topk");     // keep cap
 
-// Tracker tuning (shared for both streams)
-const TRK_IOU  = parseFloat(qs.get("Trkiou") || "0.5");
-const TRK_TTL  = parseInt(qs.get("Trkttl")   || "1", 10);
+// Pose (people keypoints)
+const POSE_SCORE_T = getNum(["Posescoret"], 0.35, "Scoret");
+const POSE_IOU_T   = getNum(["Poseiout"],   0.45, "Iout");
+const POSE_TOPK    = getInt(["Posetopk"],   50,   "Topk");
+
+// Tiny IoU tracker (separate controls per stream; legacy Trkiou/Trkttl fallback)
+const DET_TRK_IOU = getNum(["Detrkiou"], 0.50, "Trkiou");
+const DET_TRK_TTL = getInt(["Detrkttl"], 2,    "Trkttl");
+const POSE_TRK_IOU = getNum(["Posetrkiou"], 0.50, "Trkiou");
+const POSE_TRK_TTL = getInt(["Posetrkttl"], 2,    "Trkttl");
 
 // ---------- Globals ----------
 const INPUT_W = 640, INPUT_H = 640;
@@ -64,15 +115,15 @@ let processing = false;
 let detSession = null, detNmsSession = null;
 let poseSession = null;
 
-// GPU fetch tensors for detect decoder/NMS
+// GPU fetch tensors for detect decoder/NMS (detect-only)
 let tBoxes = null, tScores = null, tClasses = null;
 let gpuFetches = null;
 let gpuFetchesReady = false;
 
-// Pre-create threshold tensors for ONNX detect decoder
-const tensor_topk          = new ort.Tensor("int32",   new Int32Array([TOPK]));
-const tensor_iou_threshold = new ort.Tensor("float32", new Float32Array([IOU_T]));
-const tensor_score_thresh  = new ort.Tensor("float32", new Float32Array([SCORE_T]));
+// Pre-create threshold tensors for ONNX detect decoder (detect-only)
+const det_tensor_topk          = new ort.Tensor("int32",   new Int32Array([DET_TOPK]));
+const det_tensor_iou_threshold = new ort.Tensor("float32", new Float32Array([DET_IOU_T]));
+const det_tensor_score_thresh  = new ort.Tensor("float32", new Float32Array([DET_SCORE_T]));
 
 // ---------- DEBUG Canvas ----------
 const DEBUG_RAW    = boolish(qs.get("debug"));
@@ -171,8 +222,8 @@ class IoUTracker {
     return inter / uni;
   }
 }
-const trackerDet  = new IoUTracker(TRK_IOU, TRK_TTL);
-const trackerPose = new IoUTracker(TRK_IOU, TRK_TTL);
+const trackerDet  = new IoUTracker(DET_TRK_IOU,  DET_TRK_TTL);
+const trackerPose = new IoUTracker(POSE_TRK_IOU, POSE_TRK_TTL);
 
 // ---------- Header parsing: <BBBBHHII> ----------
 // type(10), dtype(1=u8), layout(1=CHW), pad, H, W, seq, td_frame
@@ -351,12 +402,12 @@ function makeGpuTensor(nelem, dtype, dims) {
   });
   return ort.Tensor.fromGpuBuffer(buf, { dataType: dtype, dims });
 }
-function prepareGpuFetchesForNms(sess) {
+function prepareGpuFetchesForNms(sess, topk) {
   try {
     if (!device || !sess) return;
-    tBoxes   = makeGpuTensor(TOPK * 4, "float32", [TOPK, 4]);
-    tScores  = makeGpuTensor(TOPK,     "float32", [TOPK]);
-    tClasses = makeGpuTensor(TOPK,     "float32", [TOPK]);
+    tBoxes   = makeGpuTensor(topk * 4, "float32", [topk, 4]);
+    tScores  = makeGpuTensor(topk,     "float32", [topk]);
+    tClasses = makeGpuTensor(topk,     "float32", [topk]);
 
     gpuFetches = {};
     let haveBoxes = false;
@@ -400,9 +451,9 @@ async function runDetect(input) {
   if (detNmsSession) {
     const feeds = {
       [detNmsSession.inputNames[0]]: head,
-      [detNmsSession.inputNames[1]]: tensor_topk,
-      [detNmsSession.inputNames[2]]: tensor_iou_threshold,
-      [detNmsSession.inputNames[3]]: tensor_score_thresh
+      [detNmsSession.inputNames[1]]: det_tensor_topk,
+      [detNmsSession.inputNames[2]]: det_tensor_iou_threshold,
+      [detNmsSession.inputNames[3]]: det_tensor_score_thresh
     };
     const nmsOuts = gpuFetchesReady ? await detNmsSession.run(feeds, gpuFetches)
                                     : await detNmsSession.run(feeds);
@@ -434,11 +485,11 @@ async function runDetect(input) {
       }
     } else {
       // fallback JS
-      keep = nmsPerClass(decodeYOLO(head, SCORE_T, TOPK), IOU_T, TOPK);
+      keep = nmsPerClass(decodeYOLO(head, DET_SCORE_T, DET_TOPK), DET_IOU_T, DET_TOPK);
     }
   } else {
     // JS
-    keep = nmsPerClass(decodeYOLO(head, SCORE_T, TOPK), IOU_T, TOPK);
+    keep = nmsPerClass(decodeYOLO(head, DET_SCORE_T, DET_TOPK), DET_IOU_T, DET_TOPK);
   }
   return keep;
 }
@@ -447,8 +498,8 @@ async function runPose(input) {
   if (!poseSession) return [];
   const outs = await poseSession.run({ [poseSession.inputNames[0]]: input });
   const head = outs[poseSession.outputNames[0]];
-  const dets = decodeYOLOPose(head, SCORE_T, TOPK, INPUT_W, INPUT_H);
-  return nmsPerClassWithKpts(dets, IOU_T, TOPK);
+  const dets = decodeYOLOPose(head, POSE_SCORE_T, POSE_TOPK, INPUT_W, INPUT_H);
+  return nmsPerClassWithKpts(dets, POSE_IOU_T, POSE_TOPK);
 }
 
 // ---------- Main pump ----------
@@ -569,7 +620,7 @@ async function pump() {
         executionProviders: ["webgpu"],
         graphOptimizationLevel: "all",
       });
-      if (device) prepareGpuFetchesForNms(detNmsSession);
+      if (device) prepareGpuFetchesForNms(detNmsSession, DET_TOPK);
     } catch (e) {
       console.warn("Detect decoder not available; using JS NMS.", e);
       detNmsSession = null;
@@ -578,7 +629,24 @@ async function pump() {
 
   // 4) WebSocket ingest
   ws = new WebSocket(`ws://localhost:${wsPort}`);
-  ws.onopen = () => console.log('connected socket');
+  ws.onopen = () => {
+    console.log('connected socket');
+    ws.send(JSON.stringify({loaded: true}));
+    const el = document.getElementById("status");
+    if (el) el.textContent = "";
+  };
+  ws.onerror = (event) => {
+    const statusEl = document.getElementById("status");
+    if (statusEl) {
+      // Browser doesn't always populate event.message for WS; mirror console generic.
+      statusEl.textContent = `Error: WebSocket connection to 'ws://localhost:${wsPort}/' failed.`;
+    }
+  };
+  ws.onclose = (event) => {
+    const el = document.getElementById("status");
+    if (el) el.textContent =
+      `🔌 Connection closed (code ${event.code}) trying to connect to port ${wsPort}`;
+  };
   ws.binaryType = "arraybuffer";
   ws.onmessage = (ev) => {
     if (!(ev.data instanceof ArrayBuffer)) return;
