@@ -58,17 +58,11 @@ const getInt = (primaryNames, fallback, commonFallbackName) => {
 const wsPort = qs.get("wsPort") || "62309";
 
 // ---------- Stream toggles + models (with aliases/typos/legacy) ----------
-let ENABLE_DET = getBool(
-  ["Objecttrackingenabled", "detect"],
-  true
-);
+let ENABLE_DET = getBool(["Objecttrackingenabled"], true);
 let ENABLE_POSE = getBool(["Posetrackingenabled", "pose"], true);
 
-let modelDetectKey = getStr(
-  ["Obecttrackingmodel", "modelDetect"],
-  "yolo11n"
-);
-let modelPoseKey = getStr(["Posemodel", "modelPose"], "yolo11n-pose");
+let modelDetectKey = getStr(["Obecttrackingmodel"], "yolo11n");
+let modelPoseKey = getStr(["Posemodel"], "yolo11n-pose");
 
 // Legacy single `model=` inference, only if no explicit toggles were provided anywhere.
 const legacyModel = qs.get("model");
