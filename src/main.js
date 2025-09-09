@@ -1,17 +1,34 @@
 // yolo_websocket_uint8_chw_dual.js
-// Receive CHW uint8 via WebSocket (16B header) -> FP32 -> run YOLO detect/pose (WebGPU)
-// Query params toggle detect/pose independently, can run both, merge JSON when both enabled.
+// Two ingestion modes:
+//
+//   1) Binary mode (?binary=1) — Receive CHW uint8 via WebSocket (16B header)
+//      -> FP32 -> run YOLO detect/pose (WebGPU), send predictions JSON.
+//
+//   2) Webcam mode (default) — GetUserMedia + RAF
+//      Draw visible, full-screen <video> (object-fit: cover) for the user,
+//      simultaneously repack to a square 640x640 canvas for the model,
+//      run YOLO detect/pose (WebGPU), send predictions JSON.
+//
+// In both modes, we:
+//  - Send `{loaded:true}` when WS connects
+//  - Send `{webcamDevices: [{label, deviceId}, ...]}` on WS open (and again after permission)
+//  - Support ?webcamLabel=Exact Camera Name
+//  - Respect detect/pose toggles and thresholds from query params
 
 import * as ort from "onnxruntime-web/webgpu";
 
-// ---------- ORT env ----------
+/* ================================
+   ORT environment
+================================ */
 ort.env.wasm.wasmPaths = "./";
 ort.env.allowLocalModels = true;
 ort.env.allowRemoteModels = false;
 ort.env.useBrowserCache = false;
 // ort.env.logLevel = "verbose";
 
-// ---------- Query helpers ----------
+/* ================================
+   Query helpers (readable + strict)
+================================ */
 const qs = new URLSearchParams(location.search);
 const boolish = (v, def = false) =>
   v == null ? def : /^(1|true|on|yes)$/i.test(String(v));
@@ -55,37 +72,37 @@ const getInt = (primaryNames, fallback, commonFallbackName) => {
   return fallback;
 };
 
+/* ================================
+   Global config / toggles
+================================ */
 const wsPort = qs.get("wsPort") || "62309";
+const USE_BINARY = getBool(["binary"], false); // default to webcam mode when false
 
-// ---------- Stream toggles + models (with aliases/typos/legacy) ----------
-let ENABLE_DET = getBool(["Objecttrackingenabled"], true);
+// Stream toggles + models (with aliases/typos/legacy preserved)
+let ENABLE_DET  = getBool(["Objecttrackingenabled"], true);
 let ENABLE_POSE = getBool(["Posetrackingenabled", "pose"], true);
 
 let modelDetectKey = getStr(["Obecttrackingmodel"], "yolo11n");
-let modelPoseKey = getStr(["Posemodel"], "yolo11n-pose");
+let modelPoseKey   = getStr(["Posemodel"], "yolo11n-pose");
 
-// Legacy single `model=` inference, only if no explicit toggles were provided anywhere.
+// Legacy single `model=` inference, only if no explicit toggles were provided.
 const legacyModel = qs.get("model");
 const anyToggleProvided =
   ["Poseenabled", "pose", "Objecttrackingenabled", "detect"]
     .some((k) => qs.has(k));
 if (legacyModel && !anyToggleProvided) {
   if (/pose/i.test(legacyModel)) {
-    ENABLE_POSE = true;
-    ENABLE_DET = false;
-    modelPoseKey = legacyModel;
+    ENABLE_POSE = true;  ENABLE_DET = false; modelPoseKey = legacyModel;
   } else {
-    ENABLE_DET = true;
-    ENABLE_POSE = false;
-    modelDetectKey = legacyModel;
+    ENABLE_DET  = true;  ENABLE_POSE = false; modelDetectKey = legacyModel;
   }
 }
 
-// ---------- Per-task thresholds / tuning (with back-compat fallbacks) ----------
+// Per-task thresholds / tuning (with back-compat fallbacks)
 // Detect (objects)
-const DET_SCORE_T = getNum(["Detscoret"], 0.40, "Scoret");   // score conf
-const DET_IOU_T   = getNum(["Detiout"],    0.45, "Iout");     // NMS IoU
-const DET_TOPK    = getInt(["Dettopk"],   100,  "Topk");     // keep cap
+const DET_SCORE_T = getNum(["Detscoret"], 0.40, "Scoret");
+const DET_IOU_T   = getNum(["Detiout"],   0.45, "Iout");
+const DET_TOPK    = getInt(["Dettopk"],   100,  "Topk");
 
 // Pose (people keypoints)
 const POSE_SCORE_T = getNum(["Posescoret"], 0.35, "Scoret");
@@ -93,17 +110,25 @@ const POSE_IOU_T   = getNum(["Poseiout"],   0.45, "Iout");
 const POSE_TOPK    = getInt(["Posetopk"],   50,   "Topk");
 
 // Tiny IoU tracker (separate controls per stream; legacy Trkiou/Trkttl fallback)
-const DET_TRK_IOU = getNum(["Detrkiou"], 0.50, "Trkiou");
-const DET_TRK_TTL = getInt(["Detrkttl"], 2,    "Trkttl");
-const POSE_TRK_IOU = getNum(["Posetrkiou"], 0.50, "Trkiou");
-const POSE_TRK_TTL = getInt(["Posetrkttl"], 2,    "Trkttl");
+const DET_TRK_IOU  = getNum(["Detrkiou"],    0.50, "Trkiou");
+const DET_TRK_TTL  = getInt(["Detrkttl"],    2,    "Trkttl");
+const POSE_TRK_IOU = getNum(["Posetrkiou"],  0.50, "Trkiou");
+const POSE_TRK_TTL = getInt(["Posetrkttl"],  2,    "Trkttl");
 
-// ---------- Globals ----------
+// Webcam options
+const WEBCAM_LABEL = getStr(["webcamLabel"], null);
+const FLIP_HORIZONTAL = getBool(["flipHorizontal"], true); // visual + model input flip
+
+/* ================================
+   Constants & shared state
+================================ */
 const INPUT_W = 640, INPUT_H = 640;
+
 let device = null;
 let ws = null;
-let latest = null;
-let processing = false;
+
+// latest mediaTime from requestVideoFrameCallback (webcam only)
+let lastVideoMediaTime = 0;  // seconds
 
 // Sessions per stream
 let detSession = null, detNmsSession = null;
@@ -119,24 +144,74 @@ const det_tensor_topk          = new ort.Tensor("int32",   new Int32Array([DET_T
 const det_tensor_iou_threshold = new ort.Tensor("float32", new Float32Array([DET_IOU_T]));
 const det_tensor_score_thresh  = new ort.Tensor("float32", new Float32Array([DET_SCORE_T]));
 
-// ---------- DEBUG Canvas ----------
+// Input buffer reused for both binary + webcam paths
+const NUM = 3 * INPUT_H * INPUT_W;
+const f32InputBuffer = new Float32Array(NUM);
+const inputTensor = new ort.Tensor("float32", f32InputBuffer, [1,3,INPUT_H,INPUT_W]);
+
+/* ================================
+   UI elements (status + video + offscreen canvas)
+================================ */
+const statusEl = document.getElementById("status") || (() => {
+  const el = document.createElement("div");
+  el.id = "status";
+  el.style.cssText = "position:fixed;left:12px;bottom:12px;padding:6px 8px;background:#111;color:#eee;font:12px/1.3 monospace;z-index:999999;border:1px solid #333;border-radius:6px;";
+  document.body.appendChild(el);
+  return el;
+})();
+
+function setStatus(msg) {
+  if (statusEl) statusEl.textContent = msg || "";
+}
+
+/** Ensure a visible, full-screen <video> that mirrors (optional) and doesn’t eat clicks. */
+function ensureVisibleVideo() {
+  let v = document.getElementById("video");
+  if (!v) {
+    v = document.createElement("video");
+    v.id = "video";
+    v.autoplay = true;
+    v.playsInline = true;
+    v.muted = true;
+    document.body.appendChild(v);
+  }
+  v.style.cssText = [
+    "position:fixed",
+    "inset:0",
+    "width:100vw",
+    "height:100vh",
+    "object-fit:cover",
+    "z-index:1",
+    "background:#000",
+    "pointer-events:none",
+    `transform:${FLIP_HORIZONTAL ? "scaleX(-1)" : "none"}`,
+    "transform-origin:center center",
+  ].join(";");
+
+  return v;
+}
+
+// Offscreen processing canvas (square 640x640 for model input)
+const procCanvas = document.createElement("canvas");
+procCanvas.width = INPUT_W; procCanvas.height = INPUT_H;
+const procCtx = procCanvas.getContext("2d", { willReadFrequently: true });
+
+/* ================================
+   Debug canvas (optional)
+================================ */
 const DEBUG_RAW    = boolish(qs.get("debug"));
 const DEBUG_FLIPY  = boolish(qs.get("flipY"));
 const DEBUG_SWAPRB = boolish(qs.get("swapRB"));
 const _dbgCtx = (() => {
   if (!DEBUG_RAW || typeof document === 'undefined') return null;
   const c = document.createElement('canvas');
-  c.width = 640; c.height = 640;
+  c.width = INPUT_W; c.height = INPUT_H;
   c.style.cssText = 'position:fixed;right:12px;bottom:12px;border:1px solid #444;image-rendering:pixelated;z-index:99999;background:#000;';
   document.body.appendChild(c);
   return c.getContext('2d');
 })();
-function _debugDrawCHW(job) {
+function _debugDrawCHW_fromU8CHW(payloadU8, H = INPUT_H, W = INPUT_W) {
   if (!_dbgCtx) return;
-  const { H, W, payload } = job;
-  if (_dbgCtx.canvas.width !== W || _dbgCtx.canvas.height !== H) {
-    _dbgCtx.canvas.width = W; _dbgCtx.canvas.height = H;
-  }
   const plane = W * H;
   const out = new Uint8ClampedArray(4 * plane);
   for (let y = 0; y < H; y++) {
@@ -144,9 +219,9 @@ function _debugDrawCHW(job) {
     for (let x = 0; x < W; x++) {
       const idx = ySrc * W + x;
       const p = (y * W + x) * 4;
-      let r = payload[0 * plane + idx];
-      let g = payload[1 * plane + idx];
-      let b = payload[2 * plane + idx];
+      let r = payloadU8[0 * plane + idx];
+      let g = payloadU8[1 * plane + idx];
+      let b = payloadU8[2 * plane + idx];
       if (DEBUG_SWAPRB) { const t = r; r = b; b = t; }
       out[p + 0] = r; out[p + 1] = g; out[p + 2] = b; out[p + 3] = 255;
     }
@@ -154,7 +229,9 @@ function _debugDrawCHW(job) {
   _dbgCtx.putImageData(new ImageData(out, W, H), 0, 0);
 }
 
-// ---------- Minimal IoU tracker ----------
+/* ================================
+   Minimal IoU tracker (unchanged)
+================================ */
 class IoUTracker {
   constructor(iouMatch = 0.5, ttl = 1) {
     this.iouMatch = iouMatch;
@@ -219,8 +296,10 @@ class IoUTracker {
 const trackerDet  = new IoUTracker(DET_TRK_IOU,  DET_TRK_TTL);
 const trackerPose = new IoUTracker(POSE_TRK_IOU, POSE_TRK_TTL);
 
-// ---------- Header parsing: <BBBBHHII> ----------
-// type(10), dtype(1=u8), layout(1=CHW), pad, H, W, seq, td_frame
+/* ================================
+   Binary header parsing: <BBBBHHII>
+   type(10), dtype(1=u8), layout(1=CHW), pad, H, W, seq, td_frame
+================================ */
 function parseHeader(buf) {
   if (buf.byteLength < 16) return null;
   const dv = new DataView(buf);
@@ -236,17 +315,53 @@ function parseHeader(buf) {
   return { H, W, seq, td, payload };
 }
 
-// ---------- Input tensor (reused each frame) ----------
-const NUM = 3 * INPUT_H * INPUT_W;
-const f32InputBuffer = new Float32Array(NUM);
-const inputTensor = new ort.Tensor("float32", f32InputBuffer, [1,3,INPUT_H,INPUT_W]);
-function toInputTensorInPlace(job) {
-  const u8 = job.payload; // length == NUM
-  for (let i = 0; i < NUM; i++) f32InputBuffer[i] = u8[i] * (1/255);
+/* ================================
+   Input packers (binary vs webcam)
+================================ */
+function toInputTensorFromU8CHW(job) {
+  // job.payload is U8 CHW [R-plane | G-plane | B-plane] length=3*H*W
+  const u8 = job.payload;
+  for (let i = 0; i < NUM; i++) f32InputBuffer[i] = u8[i] * (1 / 255);
+  if (_dbgCtx) _debugDrawCHW_fromU8CHW(u8, INPUT_H, INPUT_W);
   return inputTensor;
 }
 
-// ---------- Decoders ----------
+function toInputTensorFromImageData(imgData, flipH = false) {
+  // RGBA -> CHW float32 [0..1]; optional horizontal flip for model input
+  const src = imgData.data;
+  const W = imgData.width, H = imgData.height;
+  const plane = W * H;
+  // precompute indexes for flip vs non-flip
+  if (!flipH) {
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const p = (y * W + x);
+        const s = p * 4;
+        const r = src[s], g = src[s + 1], b = src[s + 2];
+        f32InputBuffer[0 * plane + p] = r / 255;
+        f32InputBuffer[1 * plane + p] = g / 255;
+        f32InputBuffer[2 * plane + p] = b / 255;
+      }
+    }
+  } else {
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const x2 = W - 1 - x;
+        const p = (y * W + x);
+        const s = (y * W + x2) * 4;
+        const r = src[s], g = src[s + 1], b = src[s + 2];
+        f32InputBuffer[0 * plane + p] = r / 255;
+        f32InputBuffer[1 * plane + p] = g / 255;
+        f32InputBuffer[2 * plane + p] = b / 255;
+      }
+    }
+  }
+  return inputTensor;
+}
+
+/* ================================
+   Decoders (unchanged)
+================================ */
 function decodeYOLO(tensor, thr, topk) {
   const d = tensor.data, sh = tensor.dims;
   let num, dim, T = false;
@@ -386,7 +501,9 @@ function nmsPerClassWithKpts(dets, iouThr, topk) {
   }
 }
 
-// ---------- GPU fetch tensor helpers (detect decoder only) ----------
+/* ================================
+   GPU fetch tensor helpers (detect decoder only)
+================================ */
 function makeGpuTensor(nelem, dtype, dims) {
   const bytesPerElem = (dtype === "float16") ? 2 : 4;
   const bytes = nelem * bytesPerElem;
@@ -426,7 +543,9 @@ function prepareGpuFetchesForNms(sess, topk) {
   }
 }
 
-// ---------- Y-flip mapping to normalized coords (0..1) ----------
+/* ================================
+   Coord mapping to normalized [0..1] with Y-flip to bottom-left origin
+================================ */
 function flipYKeypointsNorm(kpts, H) {
   if (!kpts) return kpts;
   return kpts.map(k => ({ x: k.x / H, y: (H - k.y) / H, score: k.score }));
@@ -435,7 +554,9 @@ function mapBoxYFlipNorm([x, y, w, h], H) {
   return [x / H, (H - (y + h)) / H, w / H, h / H];
 }
 
-// ---------- Inference helpers ----------
+/* ================================
+   Inference runners
+================================ */
 async function runDetect(input) {
   if (!detSession) return [];
   const outs = await detSession.run({ [detSession.inputNames[0]]: input });
@@ -496,96 +617,210 @@ async function runPose(input) {
   return nmsPerClassWithKpts(dets, POSE_IOU_T, POSE_TOPK);
 }
 
-// ---------- Main pump ----------
-async function pump() {
-  if (processing) return;
-  processing = true;
-  try {
-    const job = latest; latest = null;
-    if (!job || (!detSession && !poseSession)) return;
-    _debugDrawCHW(job);
+/* ================================
+   Output packing + send
+================================ */
+function packAndSendPreds(frameId, seq, keepDet, keepPose, videoFrame) {
+  const H = INPUT_H;
+  const predsDet = keepDet.map(t => {
+    const box = mapBoxYFlipNorm(t.box, H);
+    return {
+      tx: box[0], ty: box[1],
+      width: box[2], height: box[3],
+      categoryName: [t.label],
+      score: t.score,
+      id: t.id
+    };
+  });
 
-    const input = toInputTensorInPlace(job);
+  const predsPose = keepPose.map(t => {
+    const box = mapBoxYFlipNorm(t.box, H);
+    const kpts = flipYKeypointsNorm(t.keypoints, H);
+    return {
+      tx: box[0], ty: box[1],
+      width: box[2], height: box[3],
+      categoryName: [t.label],
+      score: t.score,
+      id: t.id,
+      keypoints: kpts
+    };
+  });
 
-    // Run enabled streams
-    let keepDet = [];
-    let keepPose = [];
-    if (detSession) keepDet = await runDetect(input);
-    if (poseSession) keepPose = await runPose(input);
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-    // Trackers (separate per stream)
-    const tracksDet  = detSession  ? trackerDet.update(keepDet)   : [];
-    const tracksPose = poseSession ? trackerPose.update(keepPose) : [];
-
-    // Map to output predictions
-    const H = INPUT_H, W = INPUT_W;
-
-    const predsDet = tracksDet.map(t => {
-      const box = mapBoxYFlipNorm(t.box, H);
-      return {
-        tx: box[0], ty: box[1],
-        width: box[2], height: box[3],
-        categoryName: [t.label],
-        score: t.score,
-        id: t.id
-      };
-    });
-
-    const predsPose = tracksPose.map(t => {
-      const box = mapBoxYFlipNorm(t.box, H);
-      const kpts = flipYKeypointsNorm(t.keypoints, H);
-      return {
-        tx: box[0], ty: box[1],
-        width: box[2], height: box[3],
-        categoryName: [t.label],
-        score: t.score,
-        id: t.id,
-        keypoints: kpts
-      };
-    });
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      // Merge or single depending on which are enabled
-      if (detSession && poseSession) {
-        ws.send(JSON.stringify({
-          type: "yolo_combined",
-          frame: job.td >>> 0,
-          seq: job.seq >>> 0,
-          width: W, height: H,
-          yolo: predsDet,
-          yolo_pose: predsPose
-        }));
-      } else if (detSession) {
-        ws.send(JSON.stringify({
-          type: "yolo",
-          frame: job.td >>> 0,
-          seq: job.seq >>> 0,
-          width: W, height: H,
-          predictions: predsDet
-        }));
-      } else if (poseSession) {
-        ws.send(JSON.stringify({
-          type: "yolo_pose",
-          frame: job.td >>> 0,
-          seq: job.seq >>> 0,
-          width: W, height: H,
-          predictions: predsPose
-        }));
-      }
-    }
-  } catch (e) {
-    console.error(e);
-  } finally {
-    processing = false;
+  if (detSession && poseSession) {
+    ws.send(JSON.stringify({
+      type: "yolo_combined",
+      frame: frameId >>> 0,
+      seq: seq >>> 0,
+      videoFrame,
+      width: INPUT_W, height: INPUT_H,
+      yolo: predsDet,
+      yolo_pose: predsPose
+    }));
+  } else if (detSession) {
+    ws.send(JSON.stringify({
+      type: "yolo",
+      frame: frameId >>> 0,
+      seq: seq >>> 0,
+      videoFrame,
+      width: INPUT_W, height: INPUT_H,
+      predictions: predsDet
+    }));
+  } else if (poseSession) {
+    ws.send(JSON.stringify({
+      type: "yolo_pose",
+      frame: frameId >>> 0,
+      seq: seq >>> 0,
+      videoFrame,
+      width: INPUT_W, height: INPUT_H,
+      predictions: predsPose
+    }));
   }
 }
 
-// ---------- Boot ----------
-(async function main() {
-  // If both toggles are off, still open the socket and draw debug—just don't run models.
-  const baseURL = new URL(".", location.href);
+/* ================================
+   Binary mode pump (unchanged core)
+================================ */
+let latestBinaryJob = null;
+let binaryProcessing = false;
+async function pumpBinary() {
+  if (binaryProcessing) return;
+  binaryProcessing = true;
+  try {
+    const job = latestBinaryJob; latestBinaryJob = null;
+    if (!job || (!detSession && !poseSession)) return;
 
-  // 1) Init sessions per stream
+    const input = toInputTensorFromU8CHW(job);
+
+    // Run streams
+    let keepDet = [];
+    let keepPose = [];
+    if (detSession)  keepDet  = await runDetect(input);
+    if (poseSession) keepPose = await runPose(input);
+
+    // Track
+    const tracksDet  = detSession  ? trackerDet.update(keepDet)   : [];
+    const tracksPose = poseSession ? trackerPose.update(keepPose) : [];
+
+    packAndSendPreds(job.td, job.seq, tracksDet, tracksPose, 0);
+  } catch (e) {
+    console.error(e);
+    setStatus(`Error (binary): ${e?.message || e}`);
+  } finally {
+    binaryProcessing = false;
+    if (latestBinaryJob) queueMicrotask(pumpBinary);
+  }
+}
+
+/* ================================
+   Webcam mode (RAF) helpers
+================================ */
+function drawPaddedSquareFromVideo(video, ctx, size, fill = "#000") {
+  ctx.canvas.width = size;
+  ctx.canvas.height = size;
+  const vw = video.videoWidth || 640;
+  const vh = video.videoHeight || 480;
+  // fit inside (letterbox) so model always sees full image
+  const scl = Math.min(size / vw, size / vh);
+  const dw = Math.round(vw * scl);
+  const dh = Math.round(vh * scl);
+  const ox = ((size - dw) / 2) | 0;
+  const oy = ((size - dh) / 2) | 0;
+
+  ctx.save();
+  ctx.clearRect(0, 0, size, size);
+  ctx.fillStyle = fill;
+  ctx.fillRect(0, 0, size, size);
+  // flip horizontally if requested, draw into padded square
+  if (FLIP_HORIZONTAL) {
+    ctx.translate(size, 0);
+    ctx.scale(-1, 1);
+    // when flipped, drawImage x is mirrored around canvas width
+    // but because we center with ox, we can draw at (ox, oy) in the flipped space
+    ctx.drawImage(video, ox, oy, dw, dh);
+  } else {
+    ctx.drawImage(video, ox, oy, dw, dh);
+  }
+  ctx.restore();
+
+  return ctx.getImageData(0, 0, size, size);
+}
+
+let rafProcessing = false;
+let prevT = 0;
+async function rafLoop(video) {
+  if (!video || video.readyState < 2) { requestAnimationFrame(() => rafLoop(video)); return; }
+  if (rafProcessing) { requestAnimationFrame(() => rafLoop(video)); return; }
+  rafProcessing = true;
+
+  try {
+    const frame = lastVideoMediaTime;
+    // Pack webcam -> 640x640 RGBA -> CHW float32
+    const img = drawPaddedSquareFromVideo(video, procCtx, INPUT_W, "#000");
+    const input = toInputTensorFromImageData(img, /*flipH*/ false); // already flipped when drawing
+
+    // Run streams
+    let keepDet = [];
+    let keepPose = [];
+    if (detSession)  keepDet  = await runDetect(input);
+    if (poseSession) keepPose = await runPose(input);
+
+    // Trackers
+    const tracksDet  = detSession  ? trackerDet.update(keepDet)   : [];
+    const tracksPose = poseSession ? trackerPose.update(keepPose) : [];
+
+    // Send predictions; webcam has no td_frame/seq — use -1
+    packAndSendPreds(-1, 0, tracksDet, tracksPose, frame);
+
+    // Minimal FPS status
+    const now = performance.now();
+    if (prevT) {
+      const fps = 1000 / (now - prevT);
+      setStatus(`FPS: ${fps.toFixed(2)} ${USE_BINARY ? "(binary)" : "(webcam)"}`);
+    }
+    prevT = now;
+  } catch (e) {
+    console.error(e);
+    setStatus(`Error (webcam): ${e?.message || e}`);
+  } finally {
+    rafProcessing = false;
+    requestAnimationFrame(() => rafLoop(video));
+  }
+}
+
+/* ================================
+   Webcam utilities
+================================ */
+async function listWebcamDevices() {
+  try {
+    const all = await navigator.mediaDevices.enumerateDevices();
+    return all.filter(d => d.kind === "videoinput")
+              .map(d => ({ label: d.label || "", deviceId: d.deviceId || "" }));
+  } catch (e) {
+    console.warn("enumerateDevices failed:", e);
+    return [];
+  }
+}
+
+function findDeviceIdByLabel(devices, wantedLabel) {
+  if (!wantedLabel) return null;
+  for (const d of devices) {
+    if (d.label === wantedLabel) return d.deviceId;
+  }
+  // try loose match if exact not found
+  const loose = devices.find(d => d.label && d.label.toLowerCase().includes(wantedLabel.toLowerCase()));
+  return loose ? loose.deviceId : null;
+}
+
+/* ================================
+   Boot
+================================ */
+(async function main() {
+  setStatus("Loading…");
+
+  // 1) Create sessions
+  const baseURL = new URL(".", location.href);
   if (ENABLE_DET) {
     const path = `${baseURL}models/${modelDetectKey}.onnx`;
     detSession = await ort.InferenceSession.create(path, {
@@ -593,7 +828,6 @@ async function pump() {
       graphOptimizationLevel: "all",
     });
   }
-
   if (ENABLE_POSE) {
     const path = `${baseURL}models/${modelPoseKey}.onnx`;
     poseSession = await ort.InferenceSession.create(path, {
@@ -602,7 +836,7 @@ async function pump() {
     });
   }
 
-  // 2) Device for GPU tensors (only needed for detect decoder GPU fetches)
+  // 2) WebGPU device (for optional GPU-bound NMS fetches)
   device = ort.env.webgpu?.device ||
            (navigator.gpu && (await navigator.gpu.requestAdapter()) && await (await navigator.gpu.requestAdapter()).requestDevice());
 
@@ -621,33 +855,85 @@ async function pump() {
     }
   }
 
-  // 4) WebSocket ingest
+  // 4) WebSocket connection
   ws = new WebSocket(`ws://localhost:${wsPort}`);
-  ws.onopen = () => {
-    console.log('connected socket');
-    ws.send(JSON.stringify({loaded: true}));
-    const el = document.getElementById("status");
-    if (el) el.textContent = "";
+  ws.binaryType = "arraybuffer";
+  ws.onopen = async () => {
+    console.log("WebSocket connected");
+    ws.send(JSON.stringify({ loaded: true }));
+
+    // Send initial webcam list (labels may be empty before permission)
+    const devices = await listWebcamDevices();
+    const deviceLabels = devices.map((d) => d.label);
+    ws.send(JSON.stringify({ webcamDevices: deviceLabels }));
+
+    setStatus(USE_BINARY ? "Ready (binary)" : "Ready (webcam)");
   };
-  ws.onerror = (event) => {
-    const statusEl = document.getElementById("status");
-    if (statusEl) {
-      // Browser doesn't always populate event.message for WS; mirror console generic.
-      statusEl.textContent = `Error: WebSocket connection to 'ws://localhost:${wsPort}/' failed.`;
-    }
+  ws.onerror = () => {
+    setStatus(`Error: WebSocket connection to 'ws://localhost:${wsPort}/' failed.`);
   };
   ws.onclose = (event) => {
-    const el = document.getElementById("status");
-    if (el) el.textContent =
-      `🔌 Connection closed (code ${event.code}) trying to connect to port ${wsPort}`;
+    setStatus(`🔌 Connection closed (code ${event.code}) on port ${wsPort}`);
   };
-  ws.binaryType = "arraybuffer";
-  ws.onmessage = (ev) => {
-    if (!(ev.data instanceof ArrayBuffer)) return;
-    const job = parseHeader(ev.data);
-    if (!job) return;
-    if (job.H !== INPUT_H || job.W !== INPUT_W) return; // expect 640x640
-    latest = job;
-    pump();
-  };
+
+  if (USE_BINARY) {
+    // -------- Path A: Binary frames (no RAF) --------
+    ws.onmessage = (ev) => {
+      if (!(ev.data instanceof ArrayBuffer)) return;
+      const job = parseHeader(ev.data);
+      if (!job) return;
+      if (job.H !== INPUT_H || job.W !== INPUT_W) return; // expect 640x640
+      latestBinaryJob = job;
+      pumpBinary();
+    };
+    return; // Binary path done
+  }
+
+  // -------- Path B: Webcam + RAF --------
+  const video = ensureVisibleVideo();
+
+  // Try to choose device by label if provided
+  const initialDevices = await listWebcamDevices();
+
+  const exactId = findDeviceIdByLabel(initialDevices, WEBCAM_LABEL);
+
+  console.log("WEBCAM", WEBCAM_LABEL, exactId, initialDevices)
+  const constraints = exactId
+    ? { video: { deviceId: { exact: exactId }, width: { ideal: window.innerWidth }, height: { ideal: window.innerHeight } } }
+    : { video: { width: { ideal: window.innerWidth }, height: { ideal: window.innerHeight } } };
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    video.srcObject = stream;
+
+    const vfc = (now, metadata) => {
+      if (metadata && typeof metadata.mediaTime === "number") {
+        if (ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ 'tick': metadata.mediaTime }));
+        }
+        lastVideoMediaTime = metadata.mediaTime; // seconds
+      }
+      video.requestVideoFrameCallback(vfc);
+    };
+    video.requestVideoFrameCallback(vfc);
+
+    // Kick off RAF loop once metadata is ready
+    video.onloadedmetadata = () => {
+      requestAnimationFrame(() => rafLoop(video));
+    };    
+
+    // After permission, labels become available; re-send a nicer list
+    // const devicesAfter = await listWebcamDevices();
+    // if (ws && ws.readyState === WebSocket.OPEN) {
+    //   ws.send(JSON.stringify({ webcamDevices: devicesAfter }));
+    // }
+
+    // Kick off RAF loop once metadata is ready
+    video.onloadedmetadata = () => {
+      requestAnimationFrame(() => rafLoop(video));
+    };
+  } catch (err) {
+    console.error("getUserMedia failed:", err);
+    setStatus(`Camera error: ${err?.message || err}`);
+  }
 })();
