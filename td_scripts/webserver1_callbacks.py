@@ -95,6 +95,8 @@ def onWebSocketReceiveText(webServerDAT, client, data):
 		op('predictions').text = data
 	elif('webcamDevices' in data):
 		op('webcam_list').text = data
+	elif('tick' in data):
+		op('tick').text = data
 	# elif('loading' in data):
 	# 	parent().par.State = "Loading"
 	elif('loaded' in data):
