@@ -18,7 +18,7 @@ That means you can use this plugin in commercial projects without needing to ope
 ### Get Started
 
 1. Download the `.tox` file from [Patreon](https://www.patreon.com/c/blankensmithing).
-2. Place the .tox file next you project .toe file so TouchDesigner can reference it locally. (NOTE if you don't do this saving your project will take an eturnity)
+2. Place the .tox file next you project .toe file so TouchDesigner can reference it locally. ⚠️NOTE if you don't do this saving your project will take an eturnity
 3. Drop it into your TouchDesigner project.
 
 ### Using this Plugin in Your Projects
@@ -36,3 +36,11 @@ The plugin communicates with TouchDesigner over **WebSockets**, which creates a 
 In short: **as long as you don’t modify the plugin’s source, you’re free to use it in commercial projects without open-sourcing your codebase.**
 
 That said — if you’d like to, I’d highly encourage you to open-source your work to support the broader open-source community.
+
+### Dev and Build Instructions
+
+`npm i`
+
+`npm run dev`
+
+`npm run build`
