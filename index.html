@@ -1,18 +1,21 @@
-<!doctype html>
+<!--Copyright (c) 2025 Blankensmithing LLC
+This file is licensed under the GNU Affero General Public License v3.0
+(or later), see https://github.com/torinmb/yolo-touchdesigner/blob/master/LICENSE.txt. -->
+
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Yolo Plugin for TouchDesigner</title>
-  </head>
-  <body>
-    <div id="container">
-      <video id="video" autoplay muted playsinline></video>
-      <canvas id="overlay"></canvas>
-      <canvas id="hidden-canvas"></canvas>
-      <div id="status">Loading model...</div>
-    </div>
-    <!-- <script src="/opencv.js" async type="text/javascript"></script> -->
-    <script type="module" src="/src/main.js"></script>
-  </body>
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Yolo Plugin for TouchDesigner</title>
+    </head>
+    <body>
+        <div id="container">
+            <video id="video" autoplay muted playsinline></video>
+            <canvas id="overlay"></canvas>
+            <canvas id="hidden-canvas"></canvas>
+            <div id="status">Loading model...</div>
+        </div>
+        <script type="module" src="/src/main.js"></script>
+    </body>
 </html>

@@ -1,3 +1,7 @@
+#Copyright (c) 2025 Blankensmithing LLC
+#This file is licensed under the GNU Affero General Public License v3.0
+#(or later), see https://github.com/torinmb/yolo-touchdesigner/blob/master/LICENSE.txt.
+
 import mimetypes
 import os
 import datetime
