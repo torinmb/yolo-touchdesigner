@@ -10,11 +10,6 @@ Welcome! This project brings [Ultralytics YOLO](https://github.com/ultralytics/u
 -   **Drop-in Component** – packaged as a `.tox` file you can load directly in TouchDesigner
 -   **Custom Models** - Bring your own custom Yolov11 Models in by exporting them with ONNX
 
-### Why WebSockets?
-
-Using WebSockets creates a **clean boundary** between the open-sourced YOLO code and your TouchDesigner work.  
-That means you can use this plugin in commercial projects without needing to open-source your entire codebase (see LICENSE for details).
-
 ### Get Started
 
 1. Download the `.tox` file from [Patreon](https://www.patreon.com/c/blankensmithing).
