@@ -28,3 +28,5 @@ Backup
 *.njsproj
 *.sln
 *.sw?
+
+*/venv/*

@@ -38,7 +38,7 @@ pip install -r requirements.txt
 Run the script with:
 
 ```bash
-python export_yolo.py --model <path_to_model.pt> [--imgsz 640] [--device cpu|cuda:0|mps]
+python exportModel.py --model <path_to_model.pt> [--device cpu|cuda:0|mps]
 ```
 
 ### Arguments
@@ -59,19 +59,19 @@ python export_yolo.py --model <path_to_model.pt> [--imgsz 640] [--device cpu|cud
 **Mac (Apple Silicon / MPS):**
 
 ```bash
-python export_yolo.py --model yolo11s.pt --device mps
+python exportModel.py --model yolo11s.pt --device mps
 ```
 
 **Windows with CUDA GPU:**
 
 ```powershell
-python export_yolo.py --model yolo11s.pt --device cuda:0
+python exportModel.py --model yolo11s.pt --device cuda:0
 ```
 
 **Windows without CUDA (CPU fallback):**
 
 ```powershell
-python export_yolo.py --model yolo11s.pt --device cpu
+python exportModel.py --model yolo11s.pt --device cpu
 ```
 
 ---
