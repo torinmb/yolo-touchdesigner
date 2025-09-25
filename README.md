@@ -1,5 +1,8 @@
 # Yolo TouchDesigner Plugin
 
+![YoloTN3](https://github.com/user-attachments/assets/2f1e7e71-cca4-4ef6-a4ab-efabedf99d07)
+
+
 Welcome! This project brings [Ultralytics YOLO](https://github.com/ultralytics/ultralytics) into [TouchDesigner](https://derivative.ca/) with **no extra install required**.
 
 ### Features
