@@ -30,3 +30,6 @@ Backup
 *.sw?
 
 */venv/*
+*/.venv2/*
+YTAssets/*
+TDMovieOut*
