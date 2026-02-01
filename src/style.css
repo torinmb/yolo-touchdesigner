@@ -1,0 +1,74 @@
+/* 
+Copyright (c) 2025 Blankensmithing LLC
+This file is licensed under the GNU Affero General Public License v3.0
+(or later), see https://github.com/torinmb/yolo-touchdesigner/blob/master/LICENSE.txt.
+*/
+
+:root {
+  --status-bg: #111;
+  --status-color: #eee;
+  --status-border: #333;
+  --debug-border: #444;
+  --debug-bg: #000;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #000;
+  color: #fff;
+  overflow: hidden; /* Prevent scrollbars */
+}
+
+#container {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+}
+
+#video {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  object-fit: cover;
+  z-index: 1;
+  background: #000;
+  pointer-events: none;
+  transform-origin: center center;
+}
+
+#video.flipped {
+  transform: scaleX(-1);
+}
+
+#status {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  padding: 6px 8px;
+  background: var(--status-bg);
+  color: var(--status-color);
+  font: 12px/1.3 monospace;
+  z-index: 999999;
+  border: 1px solid var(--status-border);
+  border-radius: 6px;
+}
+
+#debug-canvas {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  border: 1px solid var(--debug-border);
+  image-rendering: pixelated;
+  z-index: 99999;
+  background: var(--debug-bg);
+}
+
+/* Helper for elements created via JS if needed, though IDs are preferred */
+.overlay-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+}
