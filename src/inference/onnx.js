@@ -20,6 +20,8 @@ import {
 import {
     decodeYOLO_or_OBB,
     decodeYOLOPose,
+    decodeYOLOv26,
+    decodeYOLOv26Pose,
     nmsPerClass,
 } from "./postprocess.js";
 
@@ -35,6 +37,7 @@ export let detNmsSession = null;
 export let poseSession = null;
 export let device = null;
 export let IS_OBB = false;
+export let IS_V26 = false;
 
 // GPU Fetches
 let tBoxes = null,
@@ -115,17 +118,27 @@ export async function initSessions(baseURL) {
             graphOptimizationLevel: "all",
         });
 
-        // OBB Heuristics
+        // OBB / V26 Heuristics
         IS_OBB = /(^|[\\/])[^\\/]*obb/i.test(MODEL_DETECT_KEY);
+        IS_V26 = false;
+
         try {
             const out0 =
                 detSession &&
                 detSession.outputMetadata[detSession.outputNames[0]];
             const dims = out0?.dimensions || [];
+
+            // Check for v26 signature: [1, 300, 6]
+            if (dims.length === 3 && dims[1] === 300 && dims[2] === 6) {
+                IS_V26 = true;
+            }
+
             const C =
                 (dims[1] > 10 ? dims[1] : undefined) ??
                 (dims[2] > 10 ? dims[2] : undefined);
-            if (!IS_OBB && typeof C === "number" && C >= 6) {
+
+            // Only try OBB heuristic if not v26
+            if (!IS_V26 && !IS_OBB && typeof C === "number" && C >= 6) {
                 const maybeNcOBB = C - 5;
                 if (maybeNcOBB > 0) IS_OBB = true;
             }
@@ -153,7 +166,7 @@ export async function initSessions(baseURL) {
     }
 
     // 4. Detect NMS Session
-    if (detSession) {
+    if (detSession && !IS_V26) {
         const nmsPath = `${baseURL}yolo-decoder.onnx`;
         try {
             if (!IS_OBB) {
@@ -174,6 +187,12 @@ export async function runDetect(input) {
     if (!detSession) return [];
     const outs = await detSession.run({ [detSession.inputNames[0]]: input });
     const head = outs[detSession.outputNames[0]];
+
+    // v26 / DETR / NMS-included support
+    if (head.dims.length === 3 && head.dims[1] === 300 && head.dims[2] === 6) {
+        return decodeYOLOv26(head, DET_SCORE_T, DET_TOPK);
+    }
+
     let keep = [];
 
     // Fast path via ONNX decoder/NMS
@@ -253,6 +272,12 @@ export async function runPose(input) {
             input,
     });
     const head = outs[poseSession.outputNames[0]];
+
+    // v26 / DETR / NMS-included support
+    if (head.dims.length === 3 && head.dims[1] === 300 && head.dims[2] === 57) {
+        return decodeYOLOv26Pose(head, POSE_SCORE_T, POSE_TOPK);
+    }
+
     const dets = decodeYOLOPose(
         head,
         POSE_SCORE_T,

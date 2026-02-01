@@ -175,4 +175,97 @@ export function nmsPerClass(dets, iouThr, topk) {
     return keepAll;
 }
 
+export function decodeYOLOv26(tensor, score_threshold, topk) {
+    const data = tensor.data;
+    const dims = tensor.dims;
+    // Expect [1, 300, 6] or [1, N, 6]
+    // Layout: x1, y1, x2, y2, score, cls
+
+    if (dims.length !== 3 || dims[2] !== 6) return [];
+
+    const N = dims[1];
+    const stride = 6;
+    const out = [];
+
+    for (let i = 0; i < N; i++) {
+        const off = i * stride;
+        const score = data[off + 4];
+        if (score < score_threshold) continue;
+
+        const x1 = data[off + 0];
+        const y1 = data[off + 1];
+        const x2 = data[off + 2];
+        const y2 = data[off + 3];
+        const cls = data[off + 5];
+
+        // Convert xyxy -> xywh
+        const w = x2 - x1;
+        const h = y2 - y1;
+        out.push({
+            box: [x1, y1, w, h],
+            label: cls,
+            score: score,
+        });
+    }
+
+    out.sort((a, b) => b.score - a.score);
+    if (out.length > topk) out.length = topk;
+    return out;
+}
+
+export function decodeYOLOv26Pose(tensor, score_threshold, topk) {
+    const data = tensor.data;
+    const dims = tensor.dims;
+    // Expect [1, 300, 57]
+    // Layout: x1, y1, x2, y2, score, cls, [x, y, v] * 17
+
+    // Check rudimentary validity
+    if (dims.length !== 3) return [];
+    const C = dims[2];
+    // 4 box + 1 score + 1 class = 6.
+    // Rest are keypoints? (C - 6) / 3
+
+    const N = dims[1];
+    const stride = C;
+    const numKpt = Math.floor((C - 6) / 3);
+    const out = [];
+
+    for (let i = 0; i < N; i++) {
+        const off = i * stride;
+        const score = data[off + 4];
+        if (score < score_threshold) continue;
+
+        const x1 = data[off + 0];
+        const y1 = data[off + 1];
+        const x2 = data[off + 2];
+        const y2 = data[off + 3];
+        const cls = data[off + 5];
+
+        // Keypoints start at offset 6
+        const keypoints = [];
+        for (let k = 0; k < numKpt; k++) {
+            const base = off + 6 + k * 3;
+            keypoints.push({
+                x: data[base + 0],
+                y: data[base + 1],
+                score: data[base + 2],
+            });
+        }
+
+        const w = x2 - x1;
+        const h = y2 - y1;
+
+        out.push({
+            box: [x1, y1, w, h],
+            label: cls,
+            score: score,
+            keypoints: keypoints,
+        });
+    }
+
+    out.sort((a, b) => b.score - a.score);
+    if (out.length > topk) out.length = topk;
+    return out;
+}
+
 export { decodeYOLO_or_OBB };

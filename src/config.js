@@ -57,11 +57,20 @@ export const WS_PORT = qs.get("wsPort") || "62309";
 export const USE_BINARY = getBool(["binary"], false);
 
 // Stream toggles + models
-export let ENABLE_DET = getBool(["Objecttrackingenabled"], true);
-export let ENABLE_POSE = getBool(["Posetrackingenabled", "pose"], true);
+export let ENABLE_DET = getBool(
+    ["Objecttrackingenabled", "ObjectTrackingEnabled"],
+    true,
+);
+export let ENABLE_POSE = getBool(
+    ["Posetrackingenabled", "pose", "PoseTrackingEnabled"],
+    true,
+);
 
-export let MODEL_DETECT_KEY = getStr(["Obecttrackingmodel"], "yolo11n");
-export let MODEL_POSE_KEY = getStr(["Posemodel"], "yolo11n-pose");
+export let MODEL_DETECT_KEY = getStr(
+    ["Objecttrackingmodel", "Obecttrackingmodel", "ObjectTrackingModel"],
+    "yolo11n",
+);
+export let MODEL_POSE_KEY = getStr(["Posemodel", "PoseModel"], "yolo11n-pose");
 
 // Legacy single `model=` inference logic
 const legacyModel = qs.get("model");
