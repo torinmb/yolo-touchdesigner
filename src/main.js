@@ -5,13 +5,15 @@
 // yolo_websocket_uint8_chw_dual.js
 // Two ingestion modes:
 //
-//   1) Binary mode (?binary=1) — Receive CHW uint8 via WebSocket (16B header)
-//      -> FP32 -> run YOLO detect/pose (WebGPU), send predictions JSON.
+//   1) Binary mode (?binary=1)
+//      Supports BOTH:
+//        A) Legacy single-frame packet: 16B header (<BBBBHHII>) + payload(U8 CHW)
+//        B) New two-frame stream: 8B tiny header (<II> = seq, td_frame) THEN raw F32 RGBA HWC payload
+//         - Assumes payload is 640x640x4 float32 (values already in [0..1])
+//         - We repack RGBA(HWC) -> RGB(CHW) float32 into f32InputBuffer
 //
-//   2) Webcam mode (default) — GetUserMedia + RAF
-//      Draw visible, full-screen <video> (object-fit: cover) for the user,
-//      simultaneously repack to a square 640x640 canvas for the model,
-//      run YOLO detect/pose (WebGPU), send predictions JSON.
+//   2) Webcam mode (default)
+//      getUserMedia + RAF → 640x640 canvas → CHW float32 → inference.
 //
 // In both modes, we:
 //  - Send `{loaded:true}` when WS connects
@@ -147,6 +149,9 @@ let detSession = null,
     detNmsSession = null;
 let poseSession = null;
 
+// OBB detection flag
+let IS_OBB = false;
+
 // GPU fetch tensors for detect decoder/NMS (detect-only)
 let tBoxes = null,
     tScores = null,
@@ -216,7 +221,6 @@ function ensureVisibleVideo() {
         `transform:${FLIP_HORIZONTAL ? "scaleX(-1)" : "none"}`,
         "transform-origin:center center",
     ].join(";");
-
     return v;
 }
 
@@ -269,7 +273,7 @@ function _debugDrawCHW_fromU8CHW(payloadU8, H = INPUT_H, W = INPUT_W) {
 }
 
 /* ================================
-   Minimal IoU tracker (unchanged)
+   Minimal IoU tracker (PRESERVES EXTRAS)
 ================================ */
 class IoUTracker {
     constructor(iouMatch = 0.5, ttl = 1) {
@@ -278,10 +282,25 @@ class IoUTracker {
         this.nextId = 1;
         this.tracks = new Map();
     }
+
+    _copyExtras(dst, src) {
+        for (const k in src) {
+            if (
+                k === "box" ||
+                k === "label" ||
+                k === "score" ||
+                k === "keypoints"
+            )
+                continue;
+            dst[k] = src[k]; // e.g., angle, polygon, custom fields
+        }
+    }
+
     update(dets) {
         const ids = [...this.tracks.keys()];
         for (const id of ids) this.tracks.get(id).miss++;
 
+        // Pairwise IoU
         const pairs = [];
         for (let di = 0; di < dets.length; di++) {
             for (const id of ids) {
@@ -302,17 +321,19 @@ class IoUTracker {
             t.label = d.label;
             t.score = d.score;
             t.keypoints = d.keypoints;
+            this._copyExtras(t, d); // preserve angle & extras
             t.hits++;
             t.miss = 0;
             takenTrack.add(id);
             takenDet.add(di);
         }
 
+        // New tracks
         for (let di = 0; di < dets.length; di++) {
             if (takenDet.has(di)) continue;
             const d = dets[di];
             const id = this.nextId++;
-            this.tracks.set(id, {
+            const t = {
                 box: d.box,
                 label: d.label,
                 score: d.score,
@@ -320,25 +341,34 @@ class IoUTracker {
                 age: 0,
                 hits: 1,
                 miss: 0,
-            });
+            };
+            this._copyExtras(t, d);
+            this.tracks.set(id, t);
         }
 
+        // Age & prune
         for (const id of [...this.tracks.keys()]) {
             const t = this.tracks.get(id);
             t.age++;
             if (t.miss > this.ttl) this.tracks.delete(id);
         }
 
+        // Output (preserve extras)
         return [...this.tracks.entries()]
             .filter(([_, t]) => t.miss === 0)
-            .map(([id, t]) => ({
-                id,
-                box: t.box,
-                label: t.label,
-                score: t.score,
-                keypoints: t.keypoints,
-            }));
+            .map(([id, t]) => {
+                const out = {
+                    id,
+                    box: t.box,
+                    label: t.label,
+                    score: t.score,
+                    keypoints: t.keypoints,
+                };
+                this._copyExtras(out, t);
+                return out;
+            });
     }
+
     _iou(a, b) {
         const [ax, ay, aw, ah] = a,
             [bx, by, bw, bh] = b;
@@ -361,7 +391,7 @@ const trackerDet = new IoUTracker(DET_TRK_IOU, DET_TRK_TTL);
 const trackerPose = new IoUTracker(POSE_TRK_IOU, POSE_TRK_TTL);
 
 /* ================================
-   Binary header parsing: <BBBBHHII>
+   Legacy binary header parsing: <BBBBHHII>
    type(10), dtype(1=u8), layout(1=CHW), pad, H, W, seq, td_frame
 ================================ */
 function parseHeader(buf) {
@@ -380,6 +410,17 @@ function parseHeader(buf) {
 }
 
 /* ================================
+   New tiny header parser: <II> = seq, td_frame
+================================ */
+function parseTinyHeader(buf) {
+    if (!(buf instanceof ArrayBuffer) || buf.byteLength < 8) return null;
+    const dv = new DataView(buf);
+    const seq = dv.getUint32(0, true);
+    const td = dv.getUint32(4, true);
+    return { seq, td };
+}
+
+/* ================================
    Input packers (binary vs webcam)
 ================================ */
 function toInputTensorFromU8CHW(job) {
@@ -390,13 +431,35 @@ function toInputTensorFromU8CHW(job) {
     return inputTensor;
 }
 
+// New: Repack Float32 RGBA(HWC) -> Float32 RGB(CHW). Values are already [0..1].
+function toInputTensorFromF32RGBA_HWC(bufF32, H = INPUT_H, W = INPUT_W) {
+    // bufF32 is a Float32Array of length H*W*4 (RGBA interleaved)
+    const src = bufF32;
+    const plane = W * H;
+
+    // Three passes improve cache locality for the destination planes.
+    // Pass 1: R
+    let s = 0;
+    for (let p = 0; p < plane; p++, s += 4)
+        f32InputBuffer[0 * plane + p] = src[s + 0];
+    // Pass 2: G
+    s = 0;
+    for (let p = 0; p < plane; p++, s += 4)
+        f32InputBuffer[1 * plane + p] = src[s + 1];
+    // Pass 3: B
+    s = 0;
+    for (let p = 0; p < plane; p++, s += 4)
+        f32InputBuffer[2 * plane + p] = src[s + 2];
+
+    return inputTensor;
+}
+
 function toInputTensorFromImageData(imgData, flipH = false) {
     // RGBA -> CHW float32 [0..1]; optional horizontal flip for model input
     const src = imgData.data;
     const W = imgData.width,
         H = imgData.height;
     const plane = W * H;
-    // precompute indexes for flip vs non-flip
     if (!flipH) {
         for (let y = 0; y < H; y++) {
             for (let x = 0; x < W; x++) {
@@ -429,73 +492,99 @@ function toInputTensorFromImageData(imgData, flipH = false) {
 }
 
 /* ================================
-   Decoders (unchanged)
+   Decoders
 ================================ */
-function decodeYOLO(tensor, thr, topk) {
-    const d = tensor.data,
-        sh = tensor.dims;
-    let num,
-        dim,
-        T = false;
-    if (sh.length === 3) {
-        if (sh[1] === 84) {
-            num = sh[2];
-            dim = sh[1];
-            T = false;
-        } else if (sh[2] === 84) {
-            num = sh[1];
-            dim = sh[2];
-            T = true;
-        } else {
-            num = sh[sh.length - 1];
-            dim = sh[sh.length - 2];
-            T = sh[2] === dim;
-        }
-    } else if (sh.length === 2) {
-        num = sh[0];
-        dim = sh[1] - 1;
-        T = true;
-    } else return [];
+// Unified decoder for AABB + OBB (Ultralytics-style)
+// Expects OBB head layout: [x, y, w, h, theta, obj, class1..classN]
+// Handles either [1, C, N] or [1, N, C] tensors.
+// Returns [{ box:[x,y,w,h], label, score, angle? }, ...]
+function decodeYOLO_or_OBB(tensor, thr, topk, isObb) {
+    const d = tensor.data;
+    const sh = tensor.dims; // e.g. [1, 20, 8400] or [1, 8400, 20]
+    if (sh.length !== 3) return [];
+
+    const C0 = sh[1],
+        N0 = sh[2];
+    let dim, num, channelsFirst;
+    if (C0 < N0) {
+        // Typical Ultralytics: [1, C, N]
+        dim = C0;
+        num = N0;
+        channelsFirst = true;
+    } else {
+        // Fallback: [1, N, C]
+        dim = N0;
+        num = C0;
+        channelsFirst = false;
+    }
+
+    const get = channelsFirst
+        ? (c, i) => d[c * num + i] // [1, C, N] -> c*N + i
+        : (c, i) => d[i * dim + c]; // [1, N, C] -> i*C + c
+
     const W = INPUT_W,
         H = INPUT_H;
-    const sb = T ? dim : 1;
-    const sbx = T ? 1 : num;
     const out = [];
+
+    // Field indices
+    const ANGLE_IDX = isObb ? 4 : -1;
+    const OBJ_IDX = isObb ? 5 : -1;
+    const CLS_START = isObb ? 6 : 4; // AABB is [x,y,w,h, class...], OBB adds theta+obj
+
     for (let i = 0; i < num; i++) {
-        const x = d[0 * sbx + i * sb];
-        const y = d[1 * sbx + i * sb];
-        const w = d[2 * sbx + i * sb];
-        const h = d[3 * sbx + i * sb];
+        const cx = get(0, i);
+        const cy = get(1, i);
+        const w = get(2, i);
+        const h = get(3, i);
+
+        // Confidence: for OBB use obj * class; for AABB (no obj) use class directly
+        const obj = OBJ_IDX >= 0 && OBJ_IDX < dim ? get(OBJ_IDX, i) : 1.0;
+
+        // Best class
         let bestC = -1,
             bestS = -1;
-        for (let c = 4; c < dim; c++) {
-            const s = d[c * sbx + i * sb];
+        for (let c = CLS_START; c < dim; c++) {
+            const s = get(c, i) * obj;
             if (s > bestS) {
                 bestS = s;
-                bestC = c - 4;
+                bestC = c - CLS_START;
             }
         }
         if (bestS < thr) continue;
+
+        // Build AABB from either center/size or xyxy-like fallback
         let bx, by, bw, bh;
         if (w > 0 && h > 0 && w <= W * 2 && h <= H * 2) {
             bw = w;
             bh = h;
-            bx = x - w / 2;
-            by = y - h / 2;
+            bx = cx - w / 2;
+            by = cy - h / 2;
         } else {
             const x2 = w,
                 y2 = h;
-            bx = x;
-            by = y;
-            bw = x2 - x;
-            bh = y2 - y;
+            bx = cx;
+            by = cy;
+            bw = x2 - cx;
+            bh = y2 - cy;
         }
+
+        // Clamp
         bx = Math.max(0, Math.min(W - 1, bx));
         by = Math.max(0, Math.min(H - 1, by));
         bw = Math.max(1, Math.min(W - bx, bw));
         bh = Math.max(1, Math.min(H - by, bh));
-        out.push({ box: [bx, by, bw, bh], label: bestC, score: bestS });
+
+        const det = { box: [bx, by, bw, bh], label: bestC, score: bestS };
+
+        // Optional angle (radians, image coords +Y down)
+        if (ANGLE_IDX >= 0 && ANGLE_IDX < dim) {
+            const theta = get(ANGLE_IDX, i);
+            if (Number.isFinite(theta)) det.angle = theta;
+        }
+
+        out.push(det);
     }
+
     out.sort((a, b) => b.score - a.score);
     if (out.length > topk) out.length = topk;
     return out;
@@ -673,7 +762,7 @@ function prepareGpuFetchesForNms(sess, topk) {
         for (const name of sess.outputNames) {
             const md = sess.outputMetadata[name];
             const dims = md?.dimensions || [];
-            if (dims.length === 2 && !haveBoxes) {
+            if (dims.length === 2 && dims[1] === 4 && !haveBoxes) {
                 gpuFetches[name] = tBoxes;
                 haveBoxes = true;
             } else if (dims.length === 1) {
@@ -702,7 +791,7 @@ function prepareGpuFetchesForNms(sess, topk) {
 }
 
 /* ================================
-   Coord mapping to normalized [0..1] with Y-flip to bottom-left origin
+   Coord/angle helpers
 ================================ */
 function flipYKeypointsNorm(kpts, H) {
     if (!kpts) return kpts;
@@ -710,6 +799,31 @@ function flipYKeypointsNorm(kpts, H) {
 }
 function mapBoxYFlipNorm([x, y, w, h], H) {
     return [x / H, (H - (y + h)) / H, w / H, h / H];
+}
+function mapAngleToBottomLeft(angleRad) {
+    // Input angle is in image coords (+Y down); output coords are bottom-left origin => negate.
+    return -angleRad;
+}
+function boxCenter([x, y, w, h]) {
+    return [x + 0.5 * w, y + 0.5 * h];
+}
+function polygonFromXYWHR([x, y, w, h], angleRad) {
+    const [cx, cy] = boxCenter([x, y, w, h]);
+    const hw = 0.5 * w,
+        hh = 0.5 * h;
+    const c = Math.cos(angleRad),
+        s = Math.sin(angleRad);
+    // Four corners in image coords (+Y down)
+    const pts = [
+        [-hw, -hh],
+        [hw, -hh],
+        [hw, hh],
+        [-hw, hh],
+    ].map(([px, py]) => [cx + px * c - py * s, cy + px * s + py * c]);
+    return pts; // [[x1,y1],...]
+}
+function normPolyYFlip(pts, H) {
+    return pts.map(([px, py]) => [px / H, (H - py) / H]);
 }
 
 /* ================================
@@ -721,7 +835,8 @@ async function runDetect(input) {
     const head = outs[detSession.outputNames[0]];
     let keep = [];
 
-    if (detNmsSession) {
+    // AABB fast path via ONNX decoder/NMS (skip for OBB)
+    if (!IS_OBB && detNmsSession) {
         const feeds = {
             [detNmsSession.inputNames[0]]: head,
             [detNmsSession.inputNames[1]]: det_tensor_topk,
@@ -775,27 +890,23 @@ async function runDetect(input) {
                 });
             }
         } else {
-            // fallback JS
             keep = nmsPerClass(
-                decodeYOLO(head, DET_SCORE_T, DET_TOPK),
+                decodeYOLO_or_OBB(head, DET_SCORE_T, DET_TOPK, /*isObb*/ false),
                 DET_IOU_T,
                 DET_TOPK
             );
         }
-    } else {
-        // JS
-        keep = nmsPerClass(
-            decodeYOLO(head, DET_SCORE_T, DET_TOPK),
-            DET_IOU_T,
-            DET_TOPK
-        );
+        return keep;
     }
-    return keep;
+
+    // JS decode path (used for OBB or when ONNX decoder missing)
+    const dets = decodeYOLO_or_OBB(head, DET_SCORE_T, DET_TOPK, IS_OBB);
+    return nmsPerClass(dets, DET_IOU_T, DET_TOPK);
 }
 
 async function runPose(input) {
     if (!poseSession) return [];
-    const outs = await poseSession.run({ [poseSession.inputNames[0]]: input });
+    const outs = await poseSession.run({ [detSession.inputNames[0]]: input });
     const head = outs[poseSession.outputNames[0]];
     const dets = decodeYOLOPose(
         head,
@@ -814,7 +925,7 @@ function packAndSendPreds(frameId, seq, keepDet, keepPose, videoFrame) {
     const H = INPUT_H;
     const predsDet = keepDet.map((t) => {
         const box = mapBoxYFlipNorm(t.box, H);
-        return {
+        const out = {
             tx: box[0],
             ty: box[1],
             width: box[2],
@@ -823,6 +934,18 @@ function packAndSendPreds(frameId, seq, keepDet, keepPose, videoFrame) {
             score: t.score,
             id: t.id,
         };
+        // Debug:
+        console.log("t.angle", t.angle);
+
+        if (typeof t.angle === "number" && Number.isFinite(t.angle)) {
+            out.angleRadImage = t.angle; // raw radians in image coords (+Y down)
+            out.angleRad = mapAngleToBottomLeft(t.angle); // bottom-left origin
+            out.angleDeg = out.angleRad * (180 / Math.PI);
+            // Optional polygon (normalized + Y-flipped to match your coords)
+            const polyImg = polygonFromXYWHR(t.box, t.angle);
+            out.polygon = normPolyYFlip(polyImg, H); // [[x1n,y1n],...]
+        }
+        return out;
     });
 
     const predsPose = keepPose.map((t) => {
@@ -883,7 +1006,7 @@ function packAndSendPreds(frameId, seq, keepDet, keepPose, videoFrame) {
 }
 
 /* ================================
-   Binary mode pump (unchanged core)
+   Binary mode pump (legacy U8 path)
 ================================ */
 let latestBinaryJob = null;
 let binaryProcessing = false;
@@ -940,8 +1063,6 @@ function drawPaddedSquareFromVideo(video, ctx, size, fill = "#000") {
     if (FLIP_HORIZONTAL) {
         ctx.translate(size, 0);
         ctx.scale(-1, 1);
-        // when flipped, drawImage x is mirrored around canvas width
-        // but because we center with ox, we can draw at (ox, oy) in the flipped space
         ctx.drawImage(video, ox, oy, dw, dh);
     } else {
         ctx.drawImage(video, ox, oy, dw, dh);
@@ -1043,6 +1164,27 @@ function findDeviceIdByLabel(devices, wantedLabel) {
             executionProviders: ["webgpu"],
             graphOptimizationLevel: "all",
         });
+
+        // OBB detection (filename heuristic)
+        IS_OBB = /(^|[\\/])[^\\/]*obb/i.test(modelDetectKey);
+        console.log("IS_OBB initial guess:", IS_OBB);
+
+        // Secondary: one-shot metadata probe (defensive)
+        try {
+            const out0 =
+                detSession &&
+                detSession.outputMetadata[detSession.outputNames[0]];
+            const dims = out0?.dimensions || [];
+            // Try to infer channels (C) to disambiguate 4 vs 5+ geometry params
+            const C =
+                (dims[1] && (dims[1] > 10 ? dims[1] : undefined)) ??
+                (dims[2] && (dims[2] > 10 ? dims[2] : undefined));
+            if (!IS_OBB && typeof C === "number" && C >= 6) {
+                const maybeNcAABB = C - 4;
+                const maybeNcOBB = C - 5;
+                if (maybeNcOBB > 0 && maybeNcAABB <= 0) IS_OBB = true;
+            }
+        } catch {}
     }
     if (ENABLE_POSE) {
         const path = `${baseURL}models/${modelPoseKey}.onnx`;
@@ -1059,15 +1201,19 @@ function findDeviceIdByLabel(devices, wantedLabel) {
             (await navigator.gpu.requestAdapter()) &&
             (await (await navigator.gpu.requestAdapter()).requestDevice()));
 
-    // 3) Load detect decoder/NMS only if detect session present
+    // 3) Load detect decoder/NMS only if detect session present AND not OBB
     if (detSession) {
         const nmsPath = `${baseURL}yolo-decoder.onnx`;
         try {
-            detNmsSession = await ort.InferenceSession.create(nmsPath, {
-                executionProviders: ["webgpu"],
-                graphOptimizationLevel: "all",
-            });
-            if (device) prepareGpuFetchesForNms(detNmsSession, DET_TOPK);
+            if (!IS_OBB) {
+                detNmsSession = await ort.InferenceSession.create(nmsPath, {
+                    executionProviders: ["webgpu"],
+                    graphOptimizationLevel: "all",
+                });
+                if (device) prepareGpuFetchesForNms(detNmsSession, DET_TOPK);
+            } else {
+                detNmsSession = null; // skip ONNX decoder for OBB
+            }
         } catch (e) {
             console.warn("Detect decoder not available; using JS NMS.", e);
             detNmsSession = null;
@@ -1100,15 +1246,136 @@ function findDeviceIdByLabel(devices, wantedLabel) {
     };
 
     if (USE_BINARY) {
-        // -------- Path A: Binary frames (no RAF) --------
+        const F32_PAYLOAD_BYTES = INPUT_W * INPUT_H * 4 /*RGBA*/ * 4; /*bytes*/
+
+        let pendingTinyHeader = null; // {seq, td} after receiving 8B tiny header
+        let awaitingPayload = false;
+
         ws.onmessage = (ev) => {
-            if (!(ev.data instanceof ArrayBuffer)) return;
-            const job = parseHeader(ev.data);
-            if (!job) return;
-            if (job.H !== INPUT_H || job.W !== INPUT_W) return; // expect 640x640
-            latestBinaryJob = job;
-            pumpBinary();
+            const data = ev.data;
+
+            // Ignore text packets entirely
+            if (typeof data === "string") return;
+            if (!(data instanceof ArrayBuffer)) return;
+
+            const len = data.byteLength;
+            if (len == 23) return;
+
+            // ---- Case 0: Legacy single-frame u8 CHW ----
+            const legacy = parseHeader(data);
+            if (legacy) {
+                if (legacy.H === INPUT_H && legacy.W === INPUT_W) {
+                    latestBinaryJob = {
+                        H: legacy.H,
+                        W: legacy.W,
+                        seq: legacy.seq,
+                        td: legacy.td,
+                        payload: legacy.payload, // Uint8Array CHW
+                    };
+                    pumpBinary();
+                }
+                return;
+            }
+
+            // ---- Case 1: Tiny header ONLY (8 bytes) ----
+            if (len === 8) {
+                pendingTinyHeader = parseTinyHeader(data);
+                awaitingPayload = !!pendingTinyHeader;
+                return;
+            }
+
+            // ---- Case 2: Payload ONLY (expecting F32 RGBA) ----
+            if (len === F32_PAYLOAD_BYTES) {
+                if (!awaitingPayload || !pendingTinyHeader) return;
+                awaitingPayload = false;
+
+                const f32 = new Float32Array(data); // view, no copy
+                const input = toInputTensorFromF32RGBA_HWC(
+                    f32,
+                    INPUT_H,
+                    INPUT_W
+                );
+
+                (async () => {
+                    try {
+                        let keepDet = [];
+                        let keepPose = [];
+                        if (detSession) keepDet = await runDetect(input);
+                        if (poseSession) keepPose = await runPose(input);
+
+                        const tracksDet = detSession
+                            ? trackerDet.update(keepDet)
+                            : [];
+                        const tracksPose = poseSession
+                            ? trackerPose.update(keepPose)
+                            : [];
+
+                        packAndSendPreds(
+                            pendingTinyHeader.td,
+                            pendingTinyHeader.seq,
+                            tracksDet,
+                            tracksPose,
+                            0
+                        );
+                    } catch (e) {
+                        console.error(e);
+                        setStatus(`Error (binary f32): ${e?.message || e}`);
+                    } finally {
+                        pendingTinyHeader = null;
+                    }
+                })();
+                return;
+            }
+
+            // ---- Case 3: Combined (tiny header + payload in ONE message) ----
+            if (len === 8 + F32_PAYLOAD_BYTES) {
+                const headBuf = data.slice(0, 8);
+                const bodyBuf = data.slice(8);
+                const tiny = parseTinyHeader(headBuf);
+                if (!tiny) return;
+
+                const f32 = new Float32Array(bodyBuf);
+                const input = toInputTensorFromF32RGBA_HWC(
+                    f32,
+                    INPUT_H,
+                    INPUT_W
+                );
+
+                (async () => {
+                    try {
+                        let keepDet = [];
+                        let keepPose = [];
+                        if (detSession) keepDet = await runDetect(input);
+                        if (poseSession) keepPose = await runPose(input);
+
+                        const tracksDet = detSession
+                            ? trackerDet.update(keepDet)
+                            : [];
+                        const tracksPose = poseSession
+                            ? trackerPose.update(keepPose)
+                            : [];
+
+                        packAndSendPreds(
+                            tiny.td,
+                            tiny.seq,
+                            tracksDet,
+                            tracksPose,
+                            0
+                        );
+                    } catch (e) {
+                        console.error(e);
+                        setStatus(
+                            `Error (binary f32 combo): ${e?.message || e}`
+                        );
+                    }
+                })();
+                return;
+            }
+
+            // ---- Case 4: Anything else ----
+            return;
         };
+
         return; // Binary path done
     }
 
@@ -1117,10 +1384,8 @@ function findDeviceIdByLabel(devices, wantedLabel) {
 
     // Try to choose device by label if provided
     const initialDevices = await listWebcamDevices();
-
     const exactId = findDeviceIdByLabel(initialDevices, WEBCAM_LABEL);
 
-    console.log("WEBCAM", WEBCAM_LABEL, exactId, initialDevices);
     const constraints = exactId
         ? {
               video: {
@@ -1156,13 +1421,7 @@ function findDeviceIdByLabel(devices, wantedLabel) {
             requestAnimationFrame(() => rafLoop(video));
         };
 
-        // After permission, labels become available; re-send a nicer list
-        // const devicesAfter = await listWebcamDevices();
-        // if (ws && ws.readyState === WebSocket.OPEN) {
-        //   ws.send(JSON.stringify({ webcamDevices: devicesAfter }));
-        // }
-
-        // Kick off RAF loop once metadata is ready
+        // (dup guard kept from original)
         video.onloadedmetadata = () => {
             requestAnimationFrame(() => rafLoop(video));
         };
