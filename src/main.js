@@ -43,6 +43,13 @@ import {
         ws.send(JSON.stringify({ webcamDevices: devices.map((d) => d.label) }));
 
         setStatus(USE_BINARY ? "Ready (binary)" : "Ready (webcam)");
+
+        // Keep-Alive Heartbeat (every 30s)
+        setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "keepalive" }));
+            }
+        }, 30000);
     };
 
     ws.onerror = () => {

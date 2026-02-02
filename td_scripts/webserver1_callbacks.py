@@ -77,15 +77,30 @@ def onHTTPRequest(webServerDAT, request, response):
 	response['data'] = b'File not found'
 	return response
 
+def ping_loop(webServerDAT, client):
+	if client not in clients:
+		return
+	try:
+		webServerDAT.webSocketSendPing(client)
+	except:
+		pass
+	clients[client] = run(ping_loop, webServerDAT, client, delayMilliSeconds=30000)
+
 def onWebSocketOpen(webServerDAT, client, uri):
-	clients[client] = True
 	op('webserver1').addWarning(f"[{datetime.datetime.now().isoformat()}] Client connected: {client}")
 	print(f"[{datetime.datetime.now().isoformat()}] Client connected: {client}")
 	op('active_client').text = client
+	
+	# Start keepalive timer
+	clients[client] = run(ping_loop, webServerDAT, client, delayMilliSeconds=30000)
 	return
 
 def onWebSocketClose(webServerDAT, client):
 	if client in clients:
+		# Kill timer
+		try: clients[client].kill()
+		except: pass
+		
 		del clients[client]
 		op('webserver1').addWarning(f"[{datetime.datetime.now().isoformat()}] Client disconnected: {client}")
 		print(f"[{datetime.datetime.now().isoformat()}] Client disconnected: {client}")
@@ -96,6 +111,9 @@ def onWebSocketReceiveText(webServerDAT, client, data):
 	# Flow Control: acknowledge receipt, unblocking the sender
 	webServerDAT.store('busy', False)
 	
+	if '"type":"keepalive"' in data or '"type": "keepalive"' in data:
+		return
+
 	if '"type":"sync"' in data or '"type": "sync"' in data:
 		if 'tick' in data:
 			op('tick').text = data
