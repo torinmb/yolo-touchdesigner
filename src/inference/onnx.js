@@ -16,6 +16,7 @@ import {
     MODEL_POSE_KEY,
     ENABLE_DET,
     ENABLE_POSE,
+    USE_CPU,
 } from "../config.js";
 import {
     decodeYOLO_or_OBB,
@@ -110,11 +111,13 @@ function prepareGpuFetchesForNms(sess, topk) {
 }
 
 export async function initSessions(baseURL) {
+    const providers = USE_CPU ? ["wasm"] : ["webgpu"];
+
     // 1. Detect Session
     if (ENABLE_DET) {
         const path = `${baseURL}models/${MODEL_DETECT_KEY}.onnx`;
         detSession = await ort.InferenceSession.create(path, {
-            executionProviders: ["webgpu"],
+            executionProviders: providers,
             graphOptimizationLevel: "all",
         });
 
@@ -149,20 +152,24 @@ export async function initSessions(baseURL) {
     if (ENABLE_POSE) {
         const path = `${baseURL}models/${MODEL_POSE_KEY}.onnx`;
         poseSession = await ort.InferenceSession.create(path, {
-            executionProviders: ["webgpu"],
+            executionProviders: providers,
             graphOptimizationLevel: "all",
         });
     }
 
     // 3. WebGPU Device
-    try {
-        device =
-            ort.env.webgpu?.device ||
-            (navigator.gpu &&
-                (await navigator.gpu.requestAdapter()) &&
-                (await (await navigator.gpu.requestAdapter()).requestDevice()));
-    } catch (e) {
-        console.warn("WebGPU init failed", e);
+    if (!USE_CPU) {
+        try {
+            device =
+                ort.env.webgpu?.device ||
+                (navigator.gpu &&
+                    (await navigator.gpu.requestAdapter()) &&
+                    (await (
+                        await navigator.gpu.requestAdapter()
+                    ).requestDevice()));
+        } catch (e) {
+            console.warn("WebGPU init failed", e);
+        }
     }
 
     // 4. Detect NMS Session
@@ -171,7 +178,7 @@ export async function initSessions(baseURL) {
         try {
             if (!IS_OBB) {
                 detNmsSession = await ort.InferenceSession.create(nmsPath, {
-                    executionProviders: ["webgpu"],
+                    executionProviders: providers,
                     graphOptimizationLevel: "all",
                 });
                 if (device) prepareGpuFetchesForNms(detNmsSession, DET_TOPK);

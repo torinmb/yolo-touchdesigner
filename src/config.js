@@ -55,6 +55,7 @@ export const getInt = (primaryNames, fallback, commonFallbackName) => {
 ================================ */
 export const WS_PORT = qs.get("wsPort") || "62309";
 export const USE_BINARY = getBool(["binary"], false);
+export const USE_CPU = getBool(["cpu", "CPU"], false);
 
 // Stream toggles + models
 export let ENABLE_DET = getBool(

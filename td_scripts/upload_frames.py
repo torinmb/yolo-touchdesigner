@@ -2,6 +2,7 @@
 import numpy as np
 import struct
 import time
+import json
 
 HEADER_BYTES = 16
 TYPE_TENSOR  = 10
@@ -88,6 +89,22 @@ def _pack_from_interleaved_rgb(arr_rgb, H, W):
 
 def send_frame_u8_chw():
     webserver = op('yolo_server/webserver1')
+
+    # Flow Control: If browser is busy (CPU mode slow), skip frame to prevent TD stall
+    if webserver.fetch('busy', False):
+        client = op('yolo_server/active_client').text.strip()
+        if client:
+             # Send lightweight sync pulse (JSON) instead of heavy binary
+             # This keeps op('tick') and frame sync logic alive in TD
+             
+             msg = json.dumps({"sync": True, "tick": absTime.frame, "frame": absTime.frame})
+             webserver.webSocketSendText(client, msg)
+
+        # Auto-reset if stuck for > 60 frames (1s)
+        if absTime.frame - webserver.fetch('busy_ts', 0) < 60:
+            # op('frame').text = absTime.frame
+            return
+
     client    = op('yolo_server/active_client').text.strip()
     if not client:
         return
@@ -95,6 +112,10 @@ def send_frame_u8_chw():
     top = op('source')  # Either compute output (H,3W,mono/RGBA) or direct 640x640 RGB
     if top is None:
         return
+
+    # Mark busy immediately to prevent next frame from entering pipeline
+    webserver.store('busy', True)
+    webserver.store('busy_ts', absTime.frame)
 
     arr = top.numpyArray(delayed=True)  # HxWxC
     if arr is None:

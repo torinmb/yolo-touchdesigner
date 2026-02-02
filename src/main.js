@@ -60,8 +60,23 @@ import {
     if (USE_BINARY) {
         ws.onmessage = (ev) => {
             const data = ev.data;
-            // Ignore text, process binary
-            if (typeof data === "string") return;
+
+            // Handle sync/heartbeat messages (JSON) mixed with binary
+            if (typeof data === "string") {
+                try {
+                    const msg = JSON.parse(data);
+                    if (msg.sync) {
+                        sender({
+                            tick: msg.tick,
+                            videoFrame: 0,
+                            frame: msg.frame,
+                            type: "sync",
+                        });
+                    }
+                } catch (e) {}
+                return;
+            }
+
             if (data instanceof ArrayBuffer) {
                 handleBinaryMessage(data);
             }

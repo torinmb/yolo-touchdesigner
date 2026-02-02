@@ -93,6 +93,14 @@ def onWebSocketClose(webServerDAT, client):
 	return
 
 def onWebSocketReceiveText(webServerDAT, client, data):
+	# Flow Control: acknowledge receipt, unblocking the sender
+	webServerDAT.store('busy', False)
+	
+	if '"type":"sync"' in data or '"type": "sync"' in data:
+		if 'tick' in data:
+			op('tick').text = data
+		return
+
 	# If we receive results data, dump it directly into the relevant DAT
 	# Doing this here as TD 2022.33910 is much faster processing this at the WS server than WS client
 	if('type' in data):

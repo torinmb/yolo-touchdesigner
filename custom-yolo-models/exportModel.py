@@ -16,10 +16,15 @@ parser.add_argument(
     help="Image size for export (default: 640)"
 )
 parser.add_argument(
+    "--half", 
+    action="store_true", 
+    help="Enable FP16 (half-precision) export (requires CUDA)"
+)
+parser.add_argument(
     "--device", 
     type=str, 
-    default="mps", 
-    help="Device for export (e.g. 'cpu', 'cuda:0', 'mps')"
+    default="cpu", 
+    help="Device for export (e.g. 'cpu', 'cuda:0', 'mps'). Use 'cuda' for --half."
 )
 args = parser.parse_args()
 
@@ -31,7 +36,7 @@ onnx_path = model.export(
     format="onnx",
     imgsz=args.imgsz,
     dynamic=True,
-    half=False,     # Set to True if using CUDA for FP16 export
+    half=args.half,
     simplify=True,
     opset=14,
     device=args.device
