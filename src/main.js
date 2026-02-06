@@ -28,7 +28,11 @@ import {
 
     const sender = (msg) => {
         if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(msg));
+            if (msg instanceof ArrayBuffer || ArrayBuffer.isView(msg)) {
+                ws.send(msg);
+            } else {
+                ws.send(JSON.stringify(msg));
+            }
         }
     };
 

@@ -6,6 +6,8 @@ import mimetypes
 import os
 import datetime
 import struct
+import numpy as np
+
 clients = {}
 
 def onHTTPRequest(webServerDAT, request, response):
@@ -143,7 +145,25 @@ def onWebSocketReceiveText(webServerDAT, client, data):
 	return
 
 def onWebSocketReceiveBinary(webServerDAT, client, data):
-	return
+    width = int.from_bytes(data[0:4], byteorder='little')
+    height = int.from_bytes(data[4:8], byteorder='little')
+    payload = data[8:]
+
+    # Must be a multiple of 4 bytes for float32
+    if len(payload) % 4 != 0:
+        return
+
+    flat_array = np.frombuffer(payload, dtype=np.float32)
+    
+    # Reshape to image (Height, Width, 1 channel)
+    arr = flat_array.reshape((height, width, 1))
+    
+    # Copy to Script TOP
+    try:
+        op('segmentation').copyNumpyArray(arr)
+    except Exception as e:
+        pass
+    return
 
 def onWebSocketReceivePing(webServerDAT, client, data):
 	webServerDAT.webSocketSendPong(client, data=data)

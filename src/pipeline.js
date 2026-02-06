@@ -5,8 +5,10 @@
 import {
     runDetect,
     runPose,
+    runSeg,
     detSession,
     poseSession,
+    segSession,
 } from "./inference/onnx.js";
 import { trackerDet, trackerPose } from "./state.js";
 import { formatPredictions } from "./utils/protocol.js";
@@ -24,9 +26,11 @@ export async function runInferencePipeline(
 
     let keepDet = [];
     let keepPose = [];
+    let segResult = null;
 
     if (detSession) keepDet = await runDetect(inputTensor);
     if (poseSession) keepPose = await runPose(inputTensor);
+    if (segSession) segResult = await runSeg(inputTensor);
 
     // 2. Update Trackers
     // Only update trackers if the corresponding model is active.
@@ -45,6 +49,28 @@ export async function runInferencePipeline(
 
     // 4. Send Message via Callback
     if (sender) {
+        // Segmentation Binary
+        if (segResult) {
+            const { width, height, data } = segResult;
+            const headerSize = 8;
+            const payloadBytes = data.byteLength;
+            const totalSize = headerSize + payloadBytes;
+            const buf = new Uint8Array(totalSize);
+            const dv = new DataView(buf.buffer);
+
+            dv.setUint32(0, width, true); // Little Endian
+            dv.setUint32(4, height, true);
+
+            const floatView = new Uint8Array(
+                data.buffer,
+                data.byteOffset,
+                data.byteLength,
+            );
+            buf.set(floatView, 8);
+            sender(buf.buffer);
+        }
+
+        // Standard JSON
         if (detSession && poseSession) {
             sender({ ...msg, type: "yolo_combined" });
         } else if (detSession) {

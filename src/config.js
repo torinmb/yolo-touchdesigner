@@ -66,12 +66,20 @@ export let ENABLE_POSE = getBool(
     ["Posetrackingenabled", "pose", "PoseTrackingEnabled"],
     true,
 );
+export let ENABLE_SEG = getBool(
+    ["Segmentationenabled", "segmentation", "SegmentationEnabled"],
+    false,
+);
 
 export let MODEL_DETECT_KEY = getStr(
     ["Objecttrackingmodel", "Obecttrackingmodel", "ObjectTrackingModel"],
     "yolo11n",
 );
 export let MODEL_POSE_KEY = getStr(["Posemodel", "PoseModel"], "yolo11n-pose");
+export let MODEL_SEG_KEY = getStr(
+    ["Segmentationmodel", "SegmentationModel"],
+    "yolo26n-seg",
+);
 
 // Legacy single `model=` inference logic
 const legacyModel = qs.get("model");
@@ -98,6 +106,9 @@ if (legacyModel && !anyToggleProvided) {
 export const DET_SCORE_T = getNum(["Detscoret"], 0.4, "Scoret");
 export const DET_IOU_T = getNum(["Detiout"], 0.45, "Iout");
 export const DET_TOPK = getInt(["Dettopk"], 100, "Topk");
+
+export const SEG_SCORE_T = getNum(["Segscoret"], 0.4, "Scoret");
+export const SEG_TOPK = getInt(["Segtopk"], 100, "Topk");
 
 export const POSE_SCORE_T = getNum(["Posescoret"], 0.35, "Scoret");
 export const POSE_IOU_T = getNum(["Poseiout"], 0.45, "Iout");

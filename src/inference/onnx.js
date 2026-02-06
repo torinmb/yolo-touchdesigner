@@ -9,18 +9,23 @@ import {
     DET_SCORE_T,
     DET_IOU_T,
     DET_TOPK,
+    SEG_SCORE_T,
+    SEG_TOPK,
     POSE_IOU_T,
     POSE_TOPK,
     POSE_SCORE_T,
     MODEL_DETECT_KEY,
     MODEL_POSE_KEY,
+    MODEL_SEG_KEY,
     ENABLE_DET,
     ENABLE_POSE,
+    ENABLE_SEG,
     USE_CPU,
 } from "../config.js";
 import {
     decodeYOLO_or_OBB,
     decodeYOLOPose,
+    decodeYOLOSeg,
     decodeYOLOv26,
     decodeYOLOv26Pose,
     nmsPerClass,
@@ -36,6 +41,7 @@ ort.env.useBrowserCache = false;
 export let detSession = null;
 export let detNmsSession = null;
 export let poseSession = null;
+export let segSession = null;
 export let device = null;
 export let IS_OBB = false;
 export let IS_V26 = false;
@@ -152,6 +158,15 @@ export async function initSessions(baseURL) {
     if (ENABLE_POSE) {
         const path = `${baseURL}models/${MODEL_POSE_KEY}.onnx`;
         poseSession = await ort.InferenceSession.create(path, {
+            executionProviders: providers,
+            graphOptimizationLevel: "all",
+        });
+    }
+
+    // 2b. Seg Session
+    if (ENABLE_SEG) {
+        const path = `${baseURL}models/${MODEL_SEG_KEY}.onnx`;
+        segSession = await ort.InferenceSession.create(path, {
             executionProviders: providers,
             graphOptimizationLevel: "all",
         });
@@ -293,4 +308,12 @@ export async function runPose(input) {
         INPUT_H,
     );
     return nmsPerClass(dets, POSE_IOU_T, POSE_TOPK);
+}
+
+export async function runSeg(input) {
+    if (!segSession) return null;
+    const outs = await segSession.run({
+        [segSession.inputNames[0]]: input,
+    });
+    return decodeYOLOSeg(outs, segSession.outputNames, SEG_SCORE_T, SEG_TOPK);
 }
