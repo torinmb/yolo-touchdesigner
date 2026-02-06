@@ -336,10 +336,11 @@ export function decodeYOLOSeg(outs, outputNames, scoreThr, topk) {
         const coeffs = dets[k].coeffs; // Retrieve attached coeffs
         const box = dets[k].box;
 
-        const mx1 = Math.max(0, Math.floor(box[0] / scaleX));
-        const my1 = Math.max(0, Math.floor(box[1] / scaleY));
-        const mx2 = Math.min(MW, Math.ceil(box[2] / scaleX));
-        const my2 = Math.min(MH, Math.ceil(box[3] / scaleY));
+        const pad = 14;
+        const mx1 = Math.max(0, Math.floor(box[0] / scaleX) - pad);
+        const my1 = Math.max(0, Math.floor(box[1] / scaleY) - pad);
+        const mx2 = Math.min(MW, Math.ceil(box[2] / scaleX) + pad);
+        const my2 = Math.min(MH, Math.ceil(box[3] / scaleY) + pad);
 
         for (let y = my1; y < my2; y++) {
             for (let x = mx1; x < mx2; x++) {
@@ -357,7 +358,7 @@ export function decodeYOLOSeg(outs, outputNames, scoreThr, topk) {
                 const currentVal = outMap[i];
                 const currentAlpha = currentVal - Math.floor(currentVal);
 
-                if (alpha * 0.999 > currentAlpha) {
+                if (alpha * 0.99 > currentAlpha) {
                     outMap[i] = clsID + 1.0 + alpha * 0.99;
                 }
             }
