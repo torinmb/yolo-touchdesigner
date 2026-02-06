@@ -107,7 +107,7 @@ export const DET_SCORE_T = getNum(["Detscoret"], 0.4, "Scoret");
 export const DET_IOU_T = getNum(["Detiout"], 0.45, "Iout");
 export const DET_TOPK = getInt(["Dettopk"], 100, "Topk");
 
-export const SEG_SCORE_T = getNum(["Segscoret"], 0.4, "Scoret");
+export const SEG_SCORE_T = getNum(["Segscoret"], 0.1, "Scoret");
 export const SEG_TOPK = getInt(["Segtopk"], 100, "Topk");
 
 export const POSE_SCORE_T = getNum(["Posescoret"], 0.35, "Scoret");

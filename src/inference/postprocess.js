@@ -285,25 +285,30 @@ export function decodeYOLOSeg(outs, outputNames, scoreThr, topk) {
     const protoData = protoT.data;
 
     let dets = [];
-    let maskCoeffs = [];
+    // We no longer keep maskCoeffs separate, we attach them to the 'det' object
+    // so they survive the sorting and NMS process together.
 
     const dDims = detT.dims;
     const dData = detT.data;
 
-    // Check if v26 end-to-end: [1, 300, 6+32]
-    // 4 box + 1 score + 1 class + 32 coeffs = 38
     if (dDims.length === 3 && dDims[1] === 300 && dDims[2] >= 6 + MaskC) {
         const stride = dDims[2];
         for (let i = 0; i < 300; i++) {
             const off = i * stride;
             const score = dData[off + 4];
             if (score > scoreThr) {
+                const x1 = dData[off + 0];
+                const y1 = dData[off + 1];
+                const x2 = dData[off + 2];
+                const y2 = dData[off + 3];
+
                 dets.push({
+                    box: [x1, y1, x2, y2],
                     label: dData[off + 5],
                     score,
+                    // Store coefficients directly on the object to keep them linked
+                    coeffs: dData.subarray(off + 6, off + 6 + MaskC),
                 });
-                // Create subarray for coeffs
-                maskCoeffs.push(dData.subarray(off + 6, off + 6 + MaskC));
             }
         }
     } else {
@@ -313,29 +318,48 @@ export function decodeYOLOSeg(outs, outputNames, scoreThr, topk) {
     if (dets.length === 0)
         return { width: MW, height: MH, data: new Float32Array(MW * MH) };
 
+    // --- APPLY NMS (Cleanup overlapping duplicates) ---
+    // This fixes the "fighting layers" by removing duplicate boxes
+    // before we even start drawing.
+    // Using 0.45 IoU threshold (standard YOLO value)
+    dets = nmsPerClass(dets, 0.45, topk);
+
     const outMap = new Float32Array(MW * MH);
     const MH_MW = MH * MW;
 
-    // Simple JS Matrix Mul + Paint
-    // Optimizations:
-    // 1. Only process if box overlaps? (We didn't decode boxes here to save time, but maybe we should?)
-    // 2. Loop order: Pixel -> Coeffs or Object -> Pixel?
-    // Object -> Pixel:
+    const scaleX = INPUT_W / MW;
+    const scaleY = INPUT_H / MH;
+
+    // Iterate objects (Now clean and unique!)
     for (let k = 0; k < dets.length; k++) {
         const clsID = dets[k].label;
-        const coeffs = maskCoeffs[k];
+        const coeffs = dets[k].coeffs; // Retrieve attached coeffs
+        const box = dets[k].box;
 
-        for (let i = 0; i < MH_MW; i++) {
-            // Check if already painted? (Painter's algorithm: higher score overwrites? or first?)
-            // If we sort by score (not done yet), we can overwrite.
-            // Currently just iterating. Overwrite logic:
-            let sum = 0;
-            for (let c = 0; c < MaskC; c++) {
-                sum += coeffs[c] * protoData[c * MH_MW + i];
-            }
-            if (sum > 0) {
-                // Sigmoid(x) > 0.5 <=> x > 0
-                outMap[i] = clsID + 1.0;
+        const mx1 = Math.max(0, Math.floor(box[0] / scaleX));
+        const my1 = Math.max(0, Math.floor(box[1] / scaleY));
+        const mx2 = Math.min(MW, Math.ceil(box[2] / scaleX));
+        const my2 = Math.min(MH, Math.ceil(box[3] / scaleY));
+
+        for (let y = my1; y < my2; y++) {
+            for (let x = mx1; x < mx2; x++) {
+                const i = y * MW + x;
+
+                let sum = 0;
+                for (let c = 0; c < MaskC; c++) {
+                    sum += coeffs[c] * protoData[c * MH_MW + i];
+                }
+
+                // Smooth Sigmoid (0.0 to 1.0)
+                const alpha = 1.0 / (1.0 + Math.exp(-sum));
+
+                // PACKING: MAX COMPOSITING
+                const currentVal = outMap[i];
+                const currentAlpha = currentVal - Math.floor(currentVal);
+
+                if (alpha * 0.999 > currentAlpha) {
+                    outMap[i] = clsID + 1.0 + alpha * 0.99;
+                }
             }
         }
     }
