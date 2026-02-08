@@ -233,15 +233,18 @@ export function decodeYOLOv26OBB(tensor, score_threshold, topk) {
 
     for (let i = 0; i < N; i++) {
         const off = i * stride;
-        const score = data[off + 5];
+
+        // Corrected for v26/DETR OBB layout:
+        // [cx, cy, w, h, score, cls, angle]
+        const score = data[off + 4]; // Index 4 is Score
         if (score < score_threshold) continue;
 
         const cx = data[off + 0];
         const cy = data[off + 1];
         const w = data[off + 2];
         const h = data[off + 3];
-        const angle = data[off + 4];
-        const cls = data[off + 6];
+        const cls = data[off + 5]; // Index 5 is Class
+        const angle = data[off + 6]; // Index 6 is Angle
 
         let bx = cx - 0.5 * w;
         let by = cy - 0.5 * h;
