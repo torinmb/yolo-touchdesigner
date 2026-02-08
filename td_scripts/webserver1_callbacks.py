@@ -160,7 +160,7 @@ def onWebSocketReceiveBinary(webServerDAT, client, data):
     
     # Copy to Script TOP
     try:
-        op('../segmentation').copyNumpyArray(arr)
+        op('../segmentation_data').copyNumpyArray(arr)
     except Exception as e:
         pass
     return
