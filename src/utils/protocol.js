@@ -16,9 +16,11 @@ export function formatPredictions(frameId, seq, keepDet, keepPose, videoFrame) {
 
     const predsDet = keepDet.map((t) => {
         const box = mapBoxYFlipNorm(t.box, H);
+        // Use Center coordinates (cx, cy) instead of Bottom-Left (tx, ty)
+        // to ensure rotation happens around the center of the object in TD.
         const out = {
-            tx: box[0],
-            ty: box[1],
+            tx: box[0] + box[2] * 0.5,
+            ty: box[1] + box[3] * 0.5,
             width: box[2],
             height: box[3],
             categoryName: [t.label],
