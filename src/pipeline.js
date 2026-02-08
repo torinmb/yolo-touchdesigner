@@ -80,6 +80,10 @@ export async function runInferencePipeline(
         } else if (poseSession) {
             delete msg.yolo;
             sender({ ...msg, type: "yolo_pose", predictions: msg.yolo_pose });
+        } else if (segSession) {
+            // Segmentation only mode: Send empty detections to keep protocol alive
+            delete msg.yolo_pose;
+            sender({ ...msg, type: "yolo", predictions: [] });
         }
     }
 }
