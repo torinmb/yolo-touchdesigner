@@ -1,3 +1,4 @@
 ultralytics
 onnx
 onnxsim
+numpy<2
