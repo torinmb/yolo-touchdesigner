@@ -27,6 +27,7 @@ import {
     decodeYOLOPose,
     decodeYOLOSeg,
     decodeYOLOv26,
+    decodeYOLOv26OBB,
     decodeYOLOv26Pose,
     nmsPerClass,
 } from "./postprocess.js";
@@ -137,8 +138,12 @@ export async function initSessions(baseURL) {
                 detSession.outputMetadata[detSession.outputNames[0]];
             const dims = out0?.dimensions || [];
 
-            // Check for v26 signature: [1, 300, 6]
-            if (dims.length === 3 && dims[1] === 300 && dims[2] === 6) {
+            // Check for v26 signature: [1, 300, 6] (Det) or [1, 300, 7] (OBB)
+            if (
+                dims.length === 3 &&
+                dims[1] === 300 &&
+                (dims[2] === 6 || dims[2] === 7)
+            ) {
                 IS_V26 = true;
             }
 
@@ -147,11 +152,21 @@ export async function initSessions(baseURL) {
                 (dims[2] > 10 ? dims[2] : undefined);
 
             // Only try OBB heuristic if not v26
+            // NOTE: Ambiguous channel counts (e.g. 6) can confuse Detect (2 classes) vs OBB (1 class).
+            // disable heuristic and rely on model name "obb" check above.
+            /*
             if (!IS_V26 && !IS_OBB && typeof C === "number" && C >= 6) {
                 const maybeNcOBB = C - 5;
                 if (maybeNcOBB > 0) IS_OBB = true;
             }
+            */
         } catch {}
+
+        if (IS_OBB) {
+            console.log(
+                `[ONNX] OBB Mode Enabled for model: ${MODEL_DETECT_KEY}`,
+            );
+        }
     }
 
     // 2. Pose Session
@@ -211,8 +226,12 @@ export async function runDetect(input) {
     const head = outs[detSession.outputNames[0]];
 
     // v26 / DETR / NMS-included support
-    if (head.dims.length === 3 && head.dims[1] === 300 && head.dims[2] === 6) {
-        return decodeYOLOv26(head, DET_SCORE_T, DET_TOPK);
+    if (head.dims.length === 3 && head.dims[1] === 300) {
+        if (head.dims[2] === 6) {
+            return decodeYOLOv26(head, DET_SCORE_T, DET_TOPK);
+        } else if (head.dims[2] === 7) {
+            return decodeYOLOv26OBB(head, DET_SCORE_T, DET_TOPK);
+        }
     }
 
     let keep = [];

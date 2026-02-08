@@ -5,7 +5,7 @@
 import "./style.css";
 import { WS_PORT, USE_BINARY } from "./config.js";
 import { setStatus } from "./ui.js";
-import { initSessions } from "./inference/onnx.js";
+import { initSessions, IS_OBB } from "./inference/onnx.js";
 import {
     handleBinaryMessage,
     setWebSocketSender as setBinarySender,
@@ -46,7 +46,9 @@ import {
         const devices = await listWebcamDevices();
         ws.send(JSON.stringify({ webcamDevices: devices.map((d) => d.label) }));
 
-        setStatus(USE_BINARY ? "Ready (binary)" : "Ready (webcam)");
+        let statusText = USE_BINARY ? "Ready (binary)" : "Ready (webcam)";
+        if (IS_OBB) statusText += " [OBB]";
+        setStatus(statusText);
 
         // Keep-Alive Heartbeat (every 30s)
         setInterval(() => {

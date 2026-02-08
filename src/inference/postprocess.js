@@ -34,9 +34,12 @@ function decodeYOLO_or_OBB(tensor, thr, topk, isObb) {
     const out = [];
 
     // Indices
-    const ANGLE_IDX = isObb ? 4 : -1;
-    const OBJ_IDX = isObb ? 5 : -1;
-    const CLS_START = isObb ? 6 : 4;
+    // Standard YOLO OBB (v8/v11) Layout: [cx, cy, w, h, class0, class1, ..., classN, angle]
+    // Angle is the LAST channel.
+    const ANGLE_IDX = isObb ? dim - 1 : -1;
+    const OBJ_IDX = -1;
+    const CLS_START = 4;
+    const CLS_END = isObb ? dim - 1 : dim;
 
     for (let i = 0; i < num; i++) {
         const cx = get(0, i);
@@ -50,7 +53,7 @@ function decodeYOLO_or_OBB(tensor, thr, topk, isObb) {
         // Best class
         let bestC = -1,
             bestS = -1;
-        for (let c = CLS_START; c < dim; c++) {
+        for (let c = CLS_START; c < CLS_END; c++) {
             const s = get(c, i) * obj;
             if (s > bestS) {
                 bestS = s;
@@ -213,6 +216,57 @@ export function decodeYOLOv26(tensor, score_threshold, topk) {
     return out;
 }
 
+export function decodeYOLOv26OBB(tensor, score_threshold, topk) {
+    const data = tensor.data;
+    const dims = tensor.dims;
+    // Expect [1, 300, 7]
+    // Layout: cx, cy, w, h, angle, score, cls
+
+    if (dims.length !== 3 || dims[2] !== 7) return [];
+
+    const N = dims[1];
+    const stride = 7;
+    const out = [];
+
+    const W = INPUT_W;
+    const H = INPUT_H;
+
+    for (let i = 0; i < N; i++) {
+        const off = i * stride;
+        const score = data[off + 5];
+        if (score < score_threshold) continue;
+
+        const cx = data[off + 0];
+        const cy = data[off + 1];
+        const w = data[off + 2];
+        const h = data[off + 3];
+        const angle = data[off + 4];
+        const cls = data[off + 6];
+
+        let bx = cx - 0.5 * w;
+        let by = cy - 0.5 * h;
+        let bw = w;
+        let bh = h;
+
+        // Clamp to image bounds to match generic decoder
+        bx = Math.max(0, Math.min(W - 1, bx));
+        by = Math.max(0, Math.min(H - 1, by));
+        bw = Math.max(1, Math.min(W - bx, bw));
+        bh = Math.max(1, Math.min(H - by, bh));
+
+        out.push({
+            box: [bx, by, bw, bh],
+            label: cls,
+            score: score,
+            angle: angle,
+        });
+    }
+
+    out.sort((a, b) => b.score - a.score);
+    if (out.length > topk) out.length = topk;
+    return out;
+}
+
 export function decodeYOLOv26Pose(tensor, score_threshold, topk) {
     const data = tensor.data;
     const dims = tensor.dims;
@@ -324,6 +378,10 @@ export function decodeYOLOSeg(outs, outputNames, scoreThr, topk) {
     // Using 0.45 IoU threshold (standard YOLO value)
     dets = nmsPerClass(dets, 0.45, topk);
 
+    // Sort by area descending (Painter's Algorithm approximation)
+    // Large objects (background) first, Small objects (foreground) last.
+    dets.sort((a, b) => b.box[2] * b.box[3] - a.box[2] * a.box[3]);
+
     const outMap = new Float32Array(MW * MH);
     const MH_MW = MH * MW;
 
@@ -336,9 +394,9 @@ export function decodeYOLOSeg(outs, outputNames, scoreThr, topk) {
         const coeffs = dets[k].coeffs; // Retrieve attached coeffs
         const box = dets[k].box;
 
-        const pad = 14;
+        const pad = 0;
         const mx1 = Math.max(0, Math.floor(box[0] / scaleX) - pad);
-        const my1 = Math.max(0, Math.floor(box[1] / scaleY) - pad);
+        const my1 = Math.max(0, Math.floor(box[1] / scaleY) - 0);
         const mx2 = Math.min(MW, Math.ceil(box[2] / scaleX) + pad);
         const my2 = Math.min(MH, Math.ceil(box[3] / scaleY) + pad);
 
@@ -356,10 +414,20 @@ export function decodeYOLOSeg(outs, outputNames, scoreThr, topk) {
 
                 // PACKING: MAX COMPOSITING
                 const currentVal = outMap[i];
-                const currentAlpha = currentVal - Math.floor(currentVal);
+                const currentID_coded = Math.floor(currentVal);
+                let currentAlpha = currentVal - currentID_coded;
 
-                if (alpha * 0.99 > currentAlpha) {
-                    outMap[i] = clsID + 1.0 + alpha * 0.99;
+                const incomingAlphaVal = alpha * 0.99;
+
+                if (incomingAlphaVal > currentAlpha) {
+                    // New object is stronger -> Overwrite
+                    outMap[i] = clsID + 1.0 + incomingAlphaVal;
+                } else if (currentID_coded > 0) {
+                    // New object is weaker but present -> Soft occlusion
+                    // Dim the existing object by the new object's alpha
+                    // approximating "Person * (1 - Phone)"
+                    currentAlpha *= 1.0 - alpha;
+                    outMap[i] = currentID_coded + currentAlpha;
                 }
             }
         }
