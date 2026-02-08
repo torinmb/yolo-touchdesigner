@@ -3,7 +3,7 @@
 // (or later), see https://github.com/torinmb/yolo-touchdesigner/blob/master/LICENSE.txt.
 
 import { INPUT_W, INPUT_H } from "../config.js";
-import { detSession, poseSession } from "../inference/onnx.js";
+import { detSession, poseSession, segSession } from "../inference/onnx.js";
 import { toInputTensorFromU8CHW } from "../inference/io.js";
 import { runInferencePipeline } from "../pipeline.js";
 import { setStatus } from "../ui.js";
@@ -52,7 +52,7 @@ async function pumpBinary() {
         const job = latestJob;
         latestJob = null;
 
-        if (!job || (!detSession && !poseSession)) return;
+        if (!job || (!detSession && !poseSession && !segSession)) return;
 
         const input = toInputTensorFromU8CHW(job.payload, INPUT_H, INPUT_W);
 
