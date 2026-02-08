@@ -29,7 +29,7 @@ Backup
 *.sln
 *.sw?
 
-*/venv/*
+*/.venv/*
 */.venv2/*
 YTAssets/*
 TDMovieOut*

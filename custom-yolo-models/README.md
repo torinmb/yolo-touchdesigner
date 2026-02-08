@@ -11,15 +11,15 @@ This script exports a YOLO `.pt` model to ONNX format using the [Ultralytics YOL
 #### Mac / Linux
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
 #### Windows (PowerShell)
 
 ```powershell
-python -m venv venv
-.\venv\Scripts\activate
+python -m venv .venv
+.\.venv\Scripts\activate
 ```
 
 ---
@@ -43,14 +43,14 @@ python exportModel.py --model <path_to_model.pt> [--device cpu|cuda:0|mps]
 
 ### Arguments
 
--   `--model` _(required)_  
-    Path to the YOLO `.pt` model file (e.g. `yolo11s.pt`, `facen.pt`).
+- `--model` _(required)_  
+  Path to the YOLO `.pt` model file (e.g. `yolo11s.pt`, `facen.pt`).
 
--   `--device` _(optional, default depends on system)_  
-    Device to use for export:
-    -   `cpu` → Works everywhere.
-    -   `cuda:0` → NVIDIA GPU (Windows/Linux, if CUDA is available).
-    -   `mps` → Apple Silicon (Mac).
+- `--device` _(optional, default depends on system)_  
+  Device to use for export:
+    - `cpu` → Works everywhere.
+    - `cuda:0` → NVIDIA GPU (Windows/Linux, if CUDA is available).
+    - `mps` → Apple Silicon (Mac).
 
 ---
 
@@ -59,19 +59,19 @@ python exportModel.py --model <path_to_model.pt> [--device cpu|cuda:0|mps]
 **Mac (Apple Silicon / MPS):**
 
 ```bash
-python exportModel.py --model yolo11s.pt --device mps
+python exportModel.py --model yolo26n.pt --device mps
 ```
 
 **Windows with CUDA GPU:**
 
 ```powershell
-python exportModel.py --model yolo11s.pt --device cuda:0
+python exportModel.py --model yolo26n.pt --device cuda:0
 ```
 
 **Windows without CUDA (CPU fallback):**
 
 ```powershell
-python exportModel.py --model yolo11s.pt --device cpu
+python exportModel.py --model yolo26n.pt --device cpu
 ```
 
 ---
@@ -81,5 +81,5 @@ python exportModel.py --model yolo11s.pt --device cpu
 After export, the script prints the path to the generated `.onnx` file:
 
 ```
-Exported: yolo11s.onnx
+Exported: yolo26n.onnx
 ```
