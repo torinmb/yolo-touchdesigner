@@ -31,7 +31,10 @@ Backup
 
 */.venv/*
 */.venv2/*
+
 YTAssets/*
 TDMovieOut*
 src/main_old.js
 /custom-yolo-models/old_models
+/custom-yolo-models/*.onnx
+/custom-yolo-models/*.pt
