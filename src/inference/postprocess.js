@@ -325,7 +325,171 @@ export function decodeYOLOv26Pose(tensor, score_threshold, topk) {
     return out;
 }
 
-export function decodeYOLOSeg(outs, outputNames, scoreThr, topk) {
+let segPipeline = null;
+let segProtoBuffer = null;
+let segDetsBuffer = null;
+let segOutBuffer = null;
+let segReadBuffer = null;
+let segUniformBuffer = null;
+let segBindGroup = null;
+let segBufferSize = { MW: 0, MH: 0, MaskC: 0 };
+
+function initSegPipeline(device, MW, MH, MaskC) {
+    if (
+        segPipeline &&
+        segBufferSize.MW === MW &&
+        segBufferSize.MH === MH &&
+        segBufferSize.MaskC === MaskC
+    ) {
+        return;
+    }
+
+    if (segProtoBuffer) segProtoBuffer.destroy();
+    if (segDetsBuffer) segDetsBuffer.destroy();
+    if (segOutBuffer) segOutBuffer.destroy();
+    if (segReadBuffer) segReadBuffer.destroy();
+    if (segUniformBuffer) segUniformBuffer.destroy();
+
+    segBufferSize = { MW, MH, MaskC };
+
+    const protoSize = Math.ceil((MaskC * MW * MH * 4) / 16) * 16;
+    segProtoBuffer = device.createBuffer({
+        size: protoSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    const maxDets = 100; // Hardcoded max objects
+    const detStructFloats = 8 + MaskC;
+    const detsSize = Math.ceil(((4 + maxDets * detStructFloats) * 4) / 16) * 16;
+    segDetsBuffer = device.createBuffer({
+        size: detsSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    const outSize = Math.ceil((MW * MH * 4) / 16) * 16;
+    segOutBuffer = device.createBuffer({
+        size: outSize,
+        usage:
+            GPUBufferUsage.STORAGE |
+            GPUBufferUsage.COPY_SRC |
+            GPUBufferUsage.COPY_DST,
+    });
+
+    segReadBuffer = device.createBuffer({
+        size: outSize,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    segUniformBuffer = device.createBuffer({
+        size: Math.ceil((8 * 4) / 16) * 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    const shaderCode = `
+        struct Det {
+            box : vec4<f32>,
+            clsID : f32,
+            pad1 : f32,
+            pad2 : f32,
+            pad3 : f32,
+            coeffs : array<f32, ${MaskC}>
+        };
+
+        struct Dets {
+            count : u32,
+            pad1 : u32,
+            pad2 : u32,
+            pad3 : u32,
+            items : array<Det>
+        };
+
+        struct Params {
+            MW : u32,
+            MH : u32,
+            MaskC : u32,
+            pad : u32,
+            scaleX : f32,
+            scaleY : f32,
+        };
+
+        @group(0) @binding(0) var<storage, read> protoData : array<f32>;
+        @group(0) @binding(1) var<storage, read> inDets : Dets;
+        @group(0) @binding(2) var<storage, read_write> outMap : array<f32>;
+        @group(0) @binding(3) var<uniform> params : Params;
+
+        @compute @workgroup_size(16, 16)
+        fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+            let x = global_id.x;
+            let y = global_id.y;
+            let MW = params.MW;
+            let MH = params.MH;
+            let MaskC = params.MaskC;
+
+            if (x >= MW || y >= MH) {
+                return;
+            }
+
+            let i = y * MW + x;
+            
+            var currentVal : f32 = 0.0;
+            var currentID_coded : f32 = 0.0;
+            var currentAlpha : f32 = 0.0;
+
+            for (var idx = 0u; idx < inDets.count; idx++) {
+                let det = inDets.items[idx];
+                let bx1 = max(0.0, floor(det.box[0] / params.scaleX));
+                let by1 = max(0.0, floor(det.box[1] / params.scaleY));
+                let bx2 = min(f32(MW), ceil(det.box[2] / params.scaleX));
+                let bx2_safe = min(f32(MW), bx2); // Just in case
+                let by2 = min(f32(MH), ceil(det.box[3] / params.scaleY));
+
+                let fx = f32(x);
+                let fy = f32(y);
+
+                if (fx >= bx1 && fx < bx2 && fy >= by1 && fy < by2) {
+                    var sum : f32 = 0.0;
+                    for (var c = 0u; c < MaskC; c++) {
+                        sum += det.coeffs[c] * protoData[c * MW * MH + i];
+                    }
+                    
+                    let alpha = 1.0 / (1.0 + exp(-sum));
+                    let incomingAlphaVal = alpha * 0.99;
+
+                    if (incomingAlphaVal > currentAlpha) {
+                        currentVal = det.clsID + 1.0 + incomingAlphaVal;
+                        currentID_coded = floor(currentVal);
+                        currentAlpha = incomingAlphaVal;
+                    } else if (currentID_coded > 0.0) {
+                        currentAlpha *= (1.0 - alpha);
+                        currentVal = currentID_coded + currentAlpha;
+                    }
+                }
+            }
+            
+            outMap[i] = currentVal;
+        }
+    `;
+
+    segPipeline = device.createComputePipeline({
+        layout: "auto",
+        compute: {
+            module: device.createShaderModule({ code: shaderCode }),
+            entryPoint: "main",
+        },
+    });
+
+    segBindGroup = device.createBindGroup({
+        layout: segPipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: segProtoBuffer } },
+            { binding: 1, resource: { buffer: segDetsBuffer } },
+            { binding: 2, resource: { buffer: segOutBuffer } },
+            { binding: 3, resource: { buffer: segUniformBuffer } },
+        ],
+    });
+}
+
+export async function decodeYOLOSeg(outs, outputNames, scoreThr, topk, device) {
     let detT = null,
         protoT = null;
     for (const name of outputNames) {
@@ -360,7 +524,7 @@ export function decodeYOLOSeg(outs, outputNames, scoreThr, topk) {
                 const y2 = dData[off + 3];
 
                 dets.push({
-                    box: [x1, y1, x2, y2],
+                    box: [x1, y1, x2 - x1, y2 - y1],
                     label: dData[off + 5],
                     score,
                     // Store coefficients directly on the object to keep them linked
@@ -385,56 +549,115 @@ export function decodeYOLOSeg(outs, outputNames, scoreThr, topk) {
     // Large objects (background) first, Small objects (foreground) last.
     dets.sort((a, b) => b.box[2] * b.box[3] - a.box[2] * a.box[3]);
 
-    const outMap = new Float32Array(MW * MH);
-    const MH_MW = MH * MW;
-
     const scaleX = INPUT_W / MW;
     const scaleY = INPUT_H / MH;
 
-    // Iterate objects (Now clean and unique!)
-    for (let k = 0; k < dets.length; k++) {
-        const clsID = dets[k].label;
-        const coeffs = dets[k].coeffs; // Retrieve attached coeffs
-        const box = dets[k].box;
+    if (!device) {
+        // Fallback to CPU calculation if WebGPU is unavailable
+        const outMap = new Float32Array(MW * MH);
+        const MH_MW = MH * MW;
 
-        const pad = 0;
-        const mx1 = Math.max(0, Math.floor(box[0] / scaleX) - pad);
-        const my1 = Math.max(0, Math.floor(box[1] / scaleY) - 0);
-        const mx2 = Math.min(MW, Math.ceil(box[2] / scaleX) + pad);
-        const my2 = Math.min(MH, Math.ceil(box[3] / scaleY) + pad);
+        for (let k = 0; k < dets.length; k++) {
+            const clsID = dets[k].label;
+            const coeffs = dets[k].coeffs;
+            const box = dets[k].box;
 
-        for (let y = my1; y < my2; y++) {
-            for (let x = mx1; x < mx2; x++) {
-                const i = y * MW + x;
+            const pad = 0;
+            const mx1 = Math.max(0, Math.floor(box[0] / scaleX) - pad);
+            const my1 = Math.max(0, Math.floor(box[1] / scaleY) - 0);
+            const mx2 = Math.min(
+                MW,
+                Math.ceil((box[0] + box[2]) / scaleX) + pad,
+            );
+            const my2 = Math.min(
+                MH,
+                Math.ceil((box[1] + box[3]) / scaleY) + pad,
+            );
 
-                let sum = 0;
-                for (let c = 0; c < MaskC; c++) {
-                    sum += coeffs[c] * protoData[c * MH_MW + i];
-                }
+            for (let y = my1; y < my2; y++) {
+                for (let x = mx1; x < mx2; x++) {
+                    const i = y * MW + x;
 
-                // Smooth Sigmoid (0.0 to 1.0)
-                const alpha = 1.0 / (1.0 + Math.exp(-sum));
+                    let sum = 0;
+                    for (let c = 0; c < MaskC; c++) {
+                        sum += coeffs[c] * protoData[c * MH_MW + i];
+                    }
 
-                // PACKING: MAX COMPOSITING
-                const currentVal = outMap[i];
-                const currentID_coded = Math.floor(currentVal);
-                let currentAlpha = currentVal - currentID_coded;
+                    const alpha = 1.0 / (1.0 + Math.exp(-sum));
 
-                const incomingAlphaVal = alpha * 0.99;
+                    const currentVal = outMap[i];
+                    const currentID_coded = Math.floor(currentVal);
+                    let currentAlpha = currentVal - currentID_coded;
 
-                if (incomingAlphaVal > currentAlpha) {
-                    // New object is stronger -> Overwrite
-                    outMap[i] = clsID + 1.0 + incomingAlphaVal;
-                } else if (currentID_coded > 0) {
-                    // New object is weaker but present -> Soft occlusion
-                    // Dim the existing object by the new object's alpha
-                    // approximating "Person * (1 - Phone)"
-                    currentAlpha *= 1.0 - alpha;
-                    outMap[i] = currentID_coded + currentAlpha;
+                    const incomingAlphaVal = alpha * 0.99;
+
+                    if (incomingAlphaVal > currentAlpha) {
+                        outMap[i] = clsID + 1.0 + incomingAlphaVal;
+                    } else if (currentID_coded > 0) {
+                        currentAlpha *= 1.0 - alpha;
+                        outMap[i] = currentID_coded + currentAlpha;
+                    }
                 }
             }
         }
+        return { width: MW, height: MH, data: outMap };
     }
+
+    // --- WebGPU Compute Acceleration ---
+    initSegPipeline(device, MW, MH, MaskC);
+
+    device.queue.writeBuffer(segProtoBuffer, 0, protoData);
+
+    const maxDets = 100;
+    const detFloats = 8 + MaskC;
+    const mappedCount = Math.min(dets.length, maxDets);
+    const detsData = new Float32Array(4 + maxDets * detFloats);
+
+    new Uint32Array(detsData.buffer, 0, 16)[0] = mappedCount;
+
+    for (let k = 0; k < mappedCount; k++) {
+        const offset = 4 + k * detFloats;
+        const d = dets[k];
+        detsData[offset + 0] = d.box[0];
+        detsData[offset + 1] = d.box[1];
+        detsData[offset + 2] = d.box[0] + d.box[2]; // convert W back to X2 for the shader bounds check
+        detsData[offset + 3] = d.box[1] + d.box[3]; // convert H back to Y2 for the shader bounds check
+        detsData[offset + 4] = d.label;
+        detsData.set(d.coeffs, offset + 8);
+    }
+    device.queue.writeBuffer(segDetsBuffer, 0, detsData);
+
+    const paramsData = new Uint32Array(8);
+    paramsData[0] = MW;
+    paramsData[1] = MH;
+    paramsData[2] = MaskC;
+    paramsData[3] = 0;
+    const paramsF32 = new Float32Array(paramsData.buffer);
+    paramsF32[4] = scaleX;
+    paramsF32[5] = scaleY;
+    device.queue.writeBuffer(segUniformBuffer, 0, paramsData);
+
+    const commandEncoder = device.createCommandEncoder();
+    const passEncoder = commandEncoder.beginComputePass();
+    passEncoder.setPipeline(segPipeline);
+    passEncoder.setBindGroup(0, segBindGroup);
+    passEncoder.dispatchWorkgroups(Math.ceil(MW / 16), Math.ceil(MH / 16));
+    passEncoder.end();
+
+    commandEncoder.copyBufferToBuffer(
+        segOutBuffer,
+        0,
+        segReadBuffer,
+        0,
+        MW * MH * 4,
+    );
+    device.queue.submit([commandEncoder.finish()]);
+
+    await segReadBuffer.mapAsync(GPUMapMode.READ);
+    const gpuData = new Float32Array(segReadBuffer.getMappedRange());
+    // Create copy so we can unmap
+    const outMap = new Float32Array(gpuData);
+    segReadBuffer.unmap();
 
     return { width: MW, height: MH, data: outMap };
 }

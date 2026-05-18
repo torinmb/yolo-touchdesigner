@@ -334,5 +334,11 @@ export async function runSeg(input) {
     const outs = await segSession.run({
         [segSession.inputNames[0]]: input,
     });
-    return decodeYOLOSeg(outs, segSession.outputNames, SEG_SCORE_T, SEG_TOPK);
+    return decodeYOLOSeg(
+        outs,
+        segSession.outputNames,
+        SEG_SCORE_T,
+        SEG_TOPK,
+        device,
+    );
 }

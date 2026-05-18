@@ -4,15 +4,9 @@
 
 import { INPUT_W, INPUT_H, FLIP_HORIZONTAL, WEBCAM_LABEL } from "../config.js";
 import { detSession, poseSession } from "../inference/onnx.js";
-import { toInputTensorFromImageData } from "../inference/io.js";
+import { toInputTensorFromVideo } from "../inference/io.js";
 import { runInferencePipeline } from "../pipeline.js";
 import { setStatus, ensureVisibleVideo } from "../ui.js";
-
-// Offscreen buffer
-const procCanvas = document.createElement("canvas");
-procCanvas.width = INPUT_W;
-procCanvas.height = INPUT_H;
-const procCtx = procCanvas.getContext("2d", { willReadFrequently: true });
 
 let rafProcessing = false;
 let prevT = 0;
@@ -49,34 +43,6 @@ function findDeviceIdByLabel(devices, wantedLabel) {
     return loose ? loose.deviceId : null;
 }
 
-function drawPaddedSquareFromVideo(video, ctx, size, fill = "#000") {
-    ctx.canvas.width = size;
-    ctx.canvas.height = size;
-    const vw = video.videoWidth || 640;
-    const vh = video.videoHeight || 480;
-    const scl = Math.min(size / vw, size / vh);
-    const dw = Math.round(vw * scl);
-    const dh = Math.round(vh * scl);
-    const ox = ((size - dw) / 2) | 0;
-    const oy = ((size - dh) / 2) | 0;
-
-    ctx.save();
-    ctx.clearRect(0, 0, size, size);
-    ctx.fillStyle = fill;
-    ctx.fillRect(0, 0, size, size);
-
-    if (FLIP_HORIZONTAL) {
-        ctx.translate(size, 0);
-        ctx.scale(-1, 1);
-        ctx.drawImage(video, ox, oy, dw, dh);
-    } else {
-        ctx.drawImage(video, ox, oy, dw, dh);
-    }
-    ctx.restore();
-
-    return ctx.getImageData(0, 0, size, size);
-}
-
 async function rafLoop() {
     if (!_videoEl || _videoEl.readyState < 2) {
         requestAnimationFrame(rafLoop);
@@ -90,14 +56,14 @@ async function rafLoop() {
 
     try {
         const frame = lastVideoMediaTime;
-        const img = drawPaddedSquareFromVideo(
+
+        // Use WebGPU fully to get our GPU tensor
+        const input = toInputTensorFromVideo(
             _videoEl,
-            procCtx,
             INPUT_W,
-            "#000",
+            INPUT_H,
+            FLIP_HORIZONTAL,
         );
-        // flipH false because we already flipped in drawPaddedSquareFromVideo
-        const input = toInputTensorFromImageData(img, false);
 
         await runInferencePipeline(
             input,
