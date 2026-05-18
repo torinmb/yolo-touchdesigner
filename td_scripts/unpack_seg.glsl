@@ -11,7 +11,7 @@ void main()
     if (coord.x >= outSize.x || coord.y >= outSize.y) return;
 
     // 2. Fetch Interpolated Value (Smart Smooth)
-    vec2 inRes = vec2(uTD2DInfos[0].res.zw); // Fixed: Use .xy (width, height) instead of .zw (1/w, 1/h)
+    vec2 inRes = vec2(uTD2DInfos[0].res.zw); // In TouchDesigner, res.zw is (width, height), res.xy is (1/w, 1/h)
     vec2 outRes = vec2(outSize.xy);
     vec2 uv = (vec2(coord) + 0.5) / outRes;
     vec2 inPos = uv * inRes - 0.5;
