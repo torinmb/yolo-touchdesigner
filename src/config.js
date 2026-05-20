@@ -4,8 +4,14 @@
 
 export const qs = new URLSearchParams(location.search);
 
-const boolish = (v, def = false) =>
-    v == null ? def : /^(1|true|on|yes)$/i.test(String(v));
+const boolish = (v, def = false) => {
+    if (v == null) return def;
+    const s = String(v);
+    if (/^(true|on|yes)$/i.test(s)) return true;
+    const n = parseFloat(s);
+    if (!Number.isNaN(n)) return n !== 0;
+    return false;
+};
 
 const pick = (...names) => {
     for (const n of names) if (n && qs.has(n)) return qs.get(n);
@@ -56,6 +62,7 @@ export const getInt = (primaryNames, fallback, commonFallbackName) => {
 export const WS_PORT = qs.get("wsPort") || "62309";
 export const USE_BINARY = getBool(["binary"], false);
 export const USE_CPU = getBool(["cpu", "CPU"], false);
+export const DEV_MODE = getBool(["dev", "Dev"], false);
 
 // Stream toggles + models
 export let ENABLE_DET = getBool(

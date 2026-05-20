@@ -9,6 +9,7 @@ import {
     detSession,
     poseSession,
     segSession,
+    device,
 } from "./inference/onnx.js";
 import { trackerDet, trackerPose } from "./state.js";
 import { formatPredictions } from "./utils/protocol.js";
@@ -38,7 +39,8 @@ export async function runInferencePipeline(
     if (window._frameCount % 30 === 0) {
         const detC = keepDet ? keepDet.length : 0;
         const poseC = keepPose ? keepPose.length : 0;
-        setStatus(`Pipeline: det=${detC} pose=${poseC} | frame=${window._frameCount}`);
+        const backend = device ? "WebGPU" : "CPU";
+        setStatus(`Pipeline: det=${detC} pose=${poseC} | frame=${window._frameCount} | ${backend}`);
     }
 
     // 2. Update Trackers

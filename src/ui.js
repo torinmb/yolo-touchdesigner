@@ -2,7 +2,7 @@
 // This file is licensed under the GNU Affero General Public License v3.0
 // (or later), see https://github.com/torinmb/yolo-touchdesigner/blob/master/LICENSE.txt.
 
-import { FLIP_HORIZONTAL } from "./config.js";
+import { FLIP_HORIZONTAL, DEV_MODE } from "./config.js";
 
 const statusEl =
     document.getElementById("status") ||
@@ -15,6 +15,10 @@ const statusEl =
 
 export function setStatus(msg) {
     if (statusEl) {
+        if (!DEV_MODE) {
+            statusEl.style.display = "none";
+            return;
+        }
         statusEl.textContent = msg || "";
         statusEl.style.display = msg ? "" : "none";
     }
