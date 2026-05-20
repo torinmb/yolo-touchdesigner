@@ -12,6 +12,7 @@ import {
 } from "./inference/onnx.js";
 import { trackerDet, trackerPose } from "./state.js";
 import { formatPredictions } from "./utils/protocol.js";
+import { setStatus } from "./ui.js";
 
 export async function runInferencePipeline(
     inputTensor,
@@ -31,6 +32,14 @@ export async function runInferencePipeline(
     if (detSession) keepDet = await runDetect(inputTensor);
     if (poseSession) keepPose = await runPose(inputTensor);
     if (segSession) segResult = await runSeg(inputTensor);
+
+    // Track frame stats
+    window._frameCount = (window._frameCount || 0) + 1;
+    if (window._frameCount % 30 === 0) {
+        const detC = keepDet ? keepDet.length : 0;
+        const poseC = keepPose ? keepPose.length : 0;
+        setStatus(`Pipeline: det=${detC} pose=${poseC} | frame=${window._frameCount}`);
+    }
 
     // 2. Update Trackers
     // Only update trackers if the corresponding model is active.
