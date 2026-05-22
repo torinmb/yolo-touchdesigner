@@ -2,7 +2,7 @@
 // This file is licensed under the GNU Affero General Public License v3.0
 // (or later), see https://github.com/torinmb/yolo-touchdesigner/blob/master/LICENSE.txt.
 
-import { INPUT_W, INPUT_H } from "../config.js";
+import { INPUT_W, INPUT_H, PERSON_SEG_ONLY, SEG_DECAY_LIMIT } from "../config.js";
 import { iou } from "../utils/math.js";
 
 function decodeYOLO_or_OBB(tensor, thr, topk, isObb) {
@@ -453,7 +453,9 @@ function initSegPipeline(device, MW, MH, MaskC) {
                     }
                     
                     let alpha = 1.0 / (1.0 + exp(-sum));
-                    let incomingAlphaVal = alpha * 0.99;
+                    // Smooth remap to eliminate the bounding box noise floor
+                    let cleanAlpha = max(0.0, (alpha - 0.01) / 0.99);
+                    let incomingAlphaVal = cleanAlpha * 0.99;
 
                     if (incomingAlphaVal > currentAlpha) {
                         currentVal = det.clsID + 1.0 + incomingAlphaVal;
@@ -489,6 +491,9 @@ function initSegPipeline(device, MW, MH, MaskC) {
     });
 }
 
+let lastValidSegResult = null;
+let segMissFrames = 0;
+
 export async function decodeYOLOSeg(outs, outputNames, scoreThr, topk, device) {
     let detT = null,
         protoT = null;
@@ -518,6 +523,9 @@ export async function decodeYOLOSeg(outs, outputNames, scoreThr, topk, device) {
             const off = i * stride;
             const score = dData[off + 4];
             if (score > scoreThr) {
+                const label = dData[off + 5];
+                if (PERSON_SEG_ONLY && label !== 0) continue;
+
                 const x1 = dData[off + 0];
                 const y1 = dData[off + 1];
                 const x2 = dData[off + 2];
@@ -536,8 +544,28 @@ export async function decodeYOLOSeg(outs, outputNames, scoreThr, topk, device) {
         return null;
     }
 
-    if (dets.length === 0)
+    if (dets.length === 0) {
+        if (SEG_DECAY_LIMIT > 0 && lastValidSegResult && segMissFrames < SEG_DECAY_LIMIT) {
+            segMissFrames++;
+            const len = lastValidSegResult.data.length;
+            const src = lastValidSegResult.data;
+            const decayedData = new Float32Array(len);
+            for (let i = 0; i < len; i++) {
+                const val = src[i];
+                if (val > 0.0) {
+                    const id = val | 0;
+                    decayedData[i] = id + (val - id) * 0.7;
+                }
+            }
+            lastValidSegResult = { ...lastValidSegResult, data: decayedData };
+            return lastValidSegResult;
+        }
+        lastValidSegResult = null;
+        segMissFrames = 0;
         return { width: MW, height: MH, data: new Float32Array(MW * MH) };
+    }
+
+    segMissFrames = 0;
 
     // --- APPLY NMS (Cleanup overlapping duplicates) ---
     // This fixes the "fighting layers" by removing duplicate boxes
@@ -584,12 +612,14 @@ export async function decodeYOLOSeg(outs, outputNames, scoreThr, topk, device) {
                     }
 
                     const alpha = 1.0 / (1.0 + Math.exp(-sum));
+                    // Smooth remap to eliminate the bounding box noise floor
+                    const cleanAlpha = Math.max(0.0, (alpha - 0.01) / 0.99);
 
                     const currentVal = outMap[i];
                     const currentID_coded = Math.floor(currentVal);
                     let currentAlpha = currentVal - currentID_coded;
 
-                    const incomingAlphaVal = alpha * 0.99;
+                    const incomingAlphaVal = cleanAlpha * 0.99;
 
                     if (incomingAlphaVal > currentAlpha) {
                         outMap[i] = clsID + 1.0 + incomingAlphaVal;
@@ -600,7 +630,9 @@ export async function decodeYOLOSeg(outs, outputNames, scoreThr, topk, device) {
                 }
             }
         }
-        return { width: MW, height: MH, data: outMap };
+        const result = { width: MW, height: MH, data: outMap };
+        lastValidSegResult = result;
+        return result;
     }
 
     // --- WebGPU Compute Acceleration ---
@@ -659,7 +691,9 @@ export async function decodeYOLOSeg(outs, outputNames, scoreThr, topk, device) {
     const outMap = new Float32Array(gpuData);
     segReadBuffer.unmap();
 
-    return { width: MW, height: MH, data: outMap };
+    const result = { width: MW, height: MH, data: outMap };
+    lastValidSegResult = result;
+    return result;
 }
 
 export { decodeYOLO_or_OBB };

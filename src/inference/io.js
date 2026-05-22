@@ -3,7 +3,7 @@
 // (or later), see https://github.com/torinmb/yolo-touchdesigner/blob/master/LICENSE.txt.
 
 import * as ort from "onnxruntime-web/webgpu";
-import { INPUT_W, INPUT_H, FLIP_HORIZONTAL } from "../config.js";
+import { INPUT_W, INPUT_H, FLIP_HORIZONTAL, DEV_MODE, USE_BINARY } from "../config.js";
 import { device } from "./onnx.js";
 import { setStatus } from "../ui.js";
 
@@ -19,8 +19,7 @@ export let inputTensor = new ort.Tensor("float32", f32InputBuffer, [
 // Debug Canvas
 let _dbgCtx = null;
 if (typeof document !== "undefined") {
-    const DEBUG_RAW = new URLSearchParams(location.search).get("debug");
-    if (DEBUG_RAW) {
+    if (DEV_MODE && USE_BINARY) {
         const c = document.createElement("canvas");
         c.id = "debug-canvas";
         c.width = INPUT_W;

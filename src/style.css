@@ -17,7 +17,8 @@ body {
   padding: 0;
   background-color: #000;
   color: #fff;
-  overflow: hidden; /* Prevent scrollbars */
+  overflow: hidden;
+  /* Prevent scrollbars */
 }
 
 #container {
@@ -59,6 +60,8 @@ body {
   position: fixed;
   right: 12px;
   bottom: 12px;
+  width: 160px;
+  height: 160px;
   border: 1px solid var(--debug-border);
   image-rendering: pixelated;
   z-index: 99999;
