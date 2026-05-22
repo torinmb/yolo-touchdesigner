@@ -62,7 +62,7 @@ export const getInt = (primaryNames, fallback, commonFallbackName) => {
 export const WS_PORT = qs.get("wsPort") || "62309";
 export const USE_BINARY = getBool(["binary"], false);
 export const USE_CPU = getBool(["cpu", "CPU"], false);
-export const DEV_MODE = getBool(["dev", "Dev"], false);
+export const DEV_MODE = getBool(["dev", "Dev", "debug", "Debug", "DEBUG"], false);
 
 // Stream toggles + models
 export let ENABLE_DET = getBool(
@@ -75,6 +75,10 @@ export let ENABLE_POSE = getBool(
 );
 export let ENABLE_SEG = getBool(
     ["Segmentationenabled", "segmentation", "SegmentationEnabled"],
+    false,
+);
+export let PERSON_SEG_ONLY = getBool(
+    ["Personsegonly", "PoseSegOnly", "personSegOnly"],
     false,
 );
 
@@ -116,6 +120,7 @@ export const DET_TOPK = getInt(["Dettopk"], 100, "Topk");
 
 export const SEG_SCORE_T = getNum(["Segscoret"], 0.2, "Scoret");
 export const SEG_TOPK = getInt(["Segtopk"], 100, "Topk");
+export const SEG_DECAY_LIMIT = getInt(["Segdecaylimit", "segDecayLimit"], 3);
 
 export const POSE_SCORE_T = getNum(["Posescoret"], 0.35, "Scoret");
 export const POSE_IOU_T = getNum(["Poseiout"], 0.45, "Iout");
