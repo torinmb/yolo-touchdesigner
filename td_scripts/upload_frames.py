@@ -1,7 +1,8 @@
-# Execute DAT
+﻿# Execute DAT
 import numpy as np
 import struct
 import json
+import time
 
 HEADER_BYTES = 16
 TYPE_TENSOR  = 10
@@ -43,10 +44,16 @@ def _pack_from_vertical_planar_mono(arr_planar, H3, W):
     Since memory is row-major, this matches CHW natively!
     """
     H = H3 // 3
-    if arr_planar.dtype == np.float32:
-        mono_u8 = (arr_planar[..., 0] * 255.0 + 0.5).astype(np.uint8, copy=False)
-    elif arr_planar.dtype == np.uint8:
+    if arr_planar.dtype == np.uint8:
+        # ZERO-COPY FAST PATH: If C=1 and it is C-contiguous, we can use the array directly
+        # without allocating a new payload array or copying data!
+        if arr_planar.ndim == 3 and arr_planar.shape[2] == 1:
+            mono_u8 = arr_planar[:, :, 0]
+            if mono_u8.flags['C_CONTIGUOUS']:
+                return mono_u8
         mono_u8 = arr_planar[..., 0]
+    elif arr_planar.dtype == np.float32:
+        mono_u8 = (arr_planar[..., 0] * 255.0 + 0.5).astype(np.uint8, copy=False)
     else:
         mono_u8 = np.clip(arr_planar[..., 0], 0, 255).astype(np.uint8, copy=False)
 
@@ -71,9 +78,12 @@ def _pack_from_interleaved_rgb(arr_rgb, H, W):
     else:
         rgb_u8 = np.clip(arr_rgb, 0, 255).astype(np.uint8, copy=False)
 
-    payload = np.empty(3 * H * W, dtype=np.uint8)
-    planes = payload.reshape(3, H, W)
-    np.copyto(planes, rgb_u8.transpose(2, 0, 1), casting='no')
+    # Super-fast 1D slice copy (bypasses expensive 3D strided transpose copies)
+    _HW = H * W
+    payload = np.empty(3 * _HW, dtype=np.uint8)
+    payload[:_HW] = rgb_u8[:, :, 0].ravel()
+    payload[_HW:2*_HW] = rgb_u8[:, :, 1].ravel()
+    payload[2*_HW:] = rgb_u8[:, :, 2].ravel()
     return payload
 
 def _repack_task_fn(arr, H, W_or_W3, C, result_container):
@@ -118,36 +128,47 @@ def _send_payload(client, webserver, payload, H, W, frame_num):
     buf[HEADER_BYTES:] = memoryview(payload)
     webserver.webSocketSendBinary(client, buf)
 
+webserver = op('yolo_server/webserver1')
+client_op = op('yolo_server/active_client')
+top = op('source') 
 def send_frame_u8_chw():
-    webserver = op('yolo_server/webserver1')
-
-    # Flow Control: If browser is busy, skip frame to prevent TD stall
+    
+    # 1. Flow Control Check: If busy, skip frame to prevent network/pipeline flooding
     if webserver.fetch('busy', False):
-        client = op('yolo_server/active_client').text.strip()
-        if client:
-            msg = json.dumps({"sync": True, "tick": absTime.frame, "frame": absTime.frame})
-            webserver.webSocketSendText(client, msg)
-
-        # Auto-reset if stuck for > 60 frames (1s)
-        if absTime.frame - webserver.fetch('busy_ts', 0) < 60:
+        # Auto-reset busy timeout if stuck for > 1.0 second of real time
+        if time.time() - webserver.fetch('busy_ts', 0.0) >= 1.0:
+            debug("Warning: Pipeline busy timeout. Resetting busy flag.")
+            webserver.store('busy', False)
+        else:
+            # Send sync tick if client is active to keep the link alive
+            client = client_op.text.strip()
+            if client:
+                msg = json.dumps({"sync": True, "tick": absTime.frame, "frame": absTime.frame})
+                webserver.webSocketSendText(client, msg)
             return
 
-    client = op('yolo_server/active_client').text.strip()
+    client = client_op.text.strip()
     if not client:
         return
     
-    top = op('source')  # Either compute output (3H,W,mono/RGBA) or direct 640x640 RGB
+    
     if top is None:
         return
 
-    # Fetch array asynchronously
+    # Fetch array asynchronously from GPU
     arr = top.numpyArray(delayed=True)  # HxWxC
     if arr is None:
         return
 
-    # Mark busy immediately to prevent next frame from entering pipeline
+    # Deep copy the array on the main thread to ensure absolute thread-safety.
+    # This prevents the background thread from accessing active TouchDesigner-managed GPU/CPU-mapped memory,
+    # which can lead to tearing, race conditions, or segmentation faults during frame drops.
+    arr_copy = arr.copy()
+
+    # Mark busy immediately to lock the pipeline during packing/inference
+    now = time.time()
     webserver.store('busy', True)
-    webserver.store('busy_ts', absTime.frame)
+    webserver.store('busy_ts', now)
 
     H, W_or_W3, C = arr.shape
     frame_num = int(absTime.frame)
@@ -167,35 +188,45 @@ def send_frame_u8_chw():
         debug("ThreadManager TDTask class could not be resolved! Falling back to synchronous packing.")
         # Synchronous fallback if Thread Manager is missing
         try:
-            _repack_task_fn(arr, H, W_or_W3, C, result_container)
+            _repack_task_fn(arr_copy, H, W_or_W3, C, result_container)
             if result_container['success']:
                 _send_payload(client, webserver, result_container['payload'],
                               result_container['h_final'], result_container['w_final'], frame_num)
                 op('frame').text = frame_num
+                # Note: 'busy' remains True here as the browser will clear it upon receiving predictions
             else:
                 debug("Synchronous repack failed:", result_container['error'])
-        finally:
+                webserver.store('busy', False)
+        except Exception as e:
+            debug("Synchronous repack exception:", e)
             webserver.store('busy', False)
         return
 
     # Main thread callbacks
+    frame_op = op('frame')
     def on_success(*args, **kwargs):
         try:
+            sent = False
             if result_container['success']:
                 payload = result_container['payload']
                 h_final = result_container['h_final']
                 w_final = result_container['w_final']
                 
                 # Check that client and webserver are still valid
-                current_client = op('yolo_server/active_client')
+                current_client = client_op
                 if current_client and current_client.text.strip() == client:
                     _send_payload(client, webserver, payload, h_final, w_final, frame_num)
-                    op('frame').text = frame_num
+                    frame_op.text = frame_num
+                    sent = True
             else:
                 debug("Threaded repack failed:", result_container['error'])
+
+            # If we didn't successfully send a frame payload, release the busy flag immediately
+            if not sent:
+                webserver.store('busy', False)
+
         except Exception as ex:
             debug("Error in Threaded SuccessHook:", ex)
-        finally:
             webserver.store('busy', False)
 
     def on_except(*args, **kwargs):
@@ -205,7 +236,7 @@ def send_frame_u8_chw():
     # Create the task
     task = TDTask(
         target=_repack_task_fn,
-        args=(arr, H, W_or_W3, C, result_container),
+        args=(arr_copy, H, W_or_W3, C, result_container),
         SuccessHook=on_success,
         ExceptHook=on_except
     )
