@@ -109,8 +109,14 @@ def onWebSocketClose(webServerDAT, client):
 		op('active_client').text = ''
 	return
 
+predictions = op('predictions')
+webcam_list = op('webcam_list')
+tick = op('tick')
+status = op('status')
+
 def onWebSocketReceiveText(webServerDAT, client, data):
 	# Flow Control: acknowledge receipt, unblocking the sender
+	
 	webServerDAT.store('busy', False)
 	
 	if '"type":"keepalive"' in data or '"type": "keepalive"' in data:
@@ -118,32 +124,33 @@ def onWebSocketReceiveText(webServerDAT, client, data):
 
 	if '"type":"sync"' in data or '"type": "sync"' in data:
 		if 'tick' in data:
-			op('tick').text = data
+			tick.text = data
 		return
 
 	# If we receive results data, dump it directly into the relevant DAT
 	# Doing this here as TD 2022.33910 is much faster processing this at the WS server than WS client
 	if('type' in data):
-		op('predictions').text = data
+		predictions.text = data
 	elif('webcamDevices' in data):
-		op('webcam_list').text = data
+		webcam_list.text = data
 	elif('tick' in data):
-		op('tick').text = data
+		tick.text = data
 	# elif('loading' in data):
 	# 	parent().par.State = "Loading"
 	elif('loaded' in data):
 		parent().par.Loading = 0
 	elif('lastFrameTime' in data):
-		op('status').text = data
+		status.text = data
 
 	else:	
-		# print('received WS from client: ' +client)
+		print('received WS from client: ' +client)
 		for key in clients.keys():
 			if key != client:
 				# print('forwaring WS message to client: ' +key)
 				webServerDAT.webSocketSendText(key, data)
 	return
 
+segmentation_data = op('../segmentation_data')
 def onWebSocketReceiveBinary(webServerDAT, client, data):
     width = int.from_bytes(data[0:4], byteorder='little')
     height = int.from_bytes(data[4:8], byteorder='little')
@@ -160,7 +167,7 @@ def onWebSocketReceiveBinary(webServerDAT, client, data):
     
     # Copy to Script TOP
     try:
-        op('../segmentation_data').copyNumpyArray(arr)
+        segmentation_data.copyNumpyArray(arr)
     except Exception as e:
         pass
     return
