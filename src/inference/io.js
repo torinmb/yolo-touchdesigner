@@ -3,18 +3,34 @@
 // (or later), see https://github.com/torinmb/yolo-touchdesigner/blob/master/LICENSE.txt.
 
 import * as ort from "onnxruntime-web/webgpu";
-import { INPUT_W, INPUT_H, FLIP_HORIZONTAL, DEV_MODE, USE_BINARY } from "../config.js";
+import { INPUT_W, INPUT_H, DEV_MODE, USE_BINARY } from "../config.js";
 import { device } from "./onnx.js";
 import { setStatus } from "../ui.js";
+import {
+    getOrientedSourceCoords,
+    getRotatedSize,
+    normalizeRotationDeg,
+} from "../utils/orientation.js";
 
-const NUM = 3 * INPUT_H * INPUT_W;
-export const f32InputBuffer = new Float32Array(NUM);
+const DEFAULT_NUM = 3 * INPUT_H * INPUT_W;
+export let f32InputBuffer = new Float32Array(DEFAULT_NUM);
 export let inputTensor = new ort.Tensor("float32", f32InputBuffer, [
     1,
     3,
     INPUT_H,
     INPUT_W,
 ]);
+let currentCpuW = INPUT_W;
+let currentCpuH = INPUT_H;
+
+function ensureCpuInputTensor(H = INPUT_H, W = INPUT_W) {
+    if (currentCpuH === H && currentCpuW === W) return inputTensor;
+    currentCpuH = H;
+    currentCpuW = W;
+    f32InputBuffer = new Float32Array(3 * H * W);
+    inputTensor = new ort.Tensor("float32", f32InputBuffer, [1, 3, H, W]);
+    return inputTensor;
+}
 
 // Debug Canvas
 let _dbgCtx = null;
@@ -157,38 +173,58 @@ export function toInputTensorFromU8CHW(payload, H = INPUT_H, W = INPUT_W) {
     }
 
     // Fallback: CPU loop
-    for (let i = 0; i < NUM; i++) f32InputBuffer[i] = payload[i] * (1 / 255);
+    ensureCpuInputTensor(H, W);
+    const num = 3 * H * W;
+    for (let i = 0; i < num; i++) f32InputBuffer[i] = payload[i] * (1 / 255);
     return inputTensor;
 }
 
-export function toInputTensorFromImageData(imgData, flipH = false) {
+export function toInputTensorFromImageData(imgData, transform = {}) {
     const src = imgData.data;
-    const W = imgData.width,
-        H = imgData.height;
-    const plane = W * H;
+    const srcW = imgData.width;
+    const srcH = imgData.height;
+    const flipH = !!transform.flipH;
+    const flipV = !!transform.flipV;
+    const rotationDeg = normalizeRotationDeg(transform.rotationDeg);
+    const rotatedSize = getRotatedSize(srcW, srcH, rotationDeg);
+    const outW = rotatedSize.width;
+    const outH = rotatedSize.height;
+    const plane = outW * outH;
 
-    if (!flipH) {
-        for (let y = 0; y < H; y++) {
-            for (let x = 0; x < W; x++) {
-                const p = y * W + x;
+    ensureCpuInputTensor(outH, outW);
+
+    if (!flipH && !flipV && rotationDeg === 0) {
+        for (let y = 0; y < srcH; y++) {
+            for (let x = 0; x < srcW; x++) {
+                const p = y * srcW + x;
                 const s = p * 4;
                 f32InputBuffer[0 * plane + p] = src[s] / 255;
                 f32InputBuffer[1 * plane + p] = src[s + 1] / 255;
                 f32InputBuffer[2 * plane + p] = src[s + 2] / 255;
             }
         }
-    } else {
-        for (let y = 0; y < H; y++) {
-            for (let x = 0; x < W; x++) {
-                const x2 = W - 1 - x;
-                const p = y * W + x;
-                const s = (y * W + x2) * 4;
-                f32InputBuffer[0 * plane + p] = src[s] / 255;
-                f32InputBuffer[1 * plane + p] = src[s + 1] / 255;
-                f32InputBuffer[2 * plane + p] = src[s + 2] / 255;
-            }
+        return inputTensor;
+    }
+
+    for (let y = 0; y < outH; y++) {
+        for (let x = 0; x < outW; x++) {
+            const p = y * outW + x;
+            const srcPos = getOrientedSourceCoords(
+                x,
+                y,
+                srcW,
+                srcH,
+                flipH,
+                flipV,
+                rotationDeg,
+            );
+            const s = (srcPos.y * srcW + srcPos.x) * 4;
+            f32InputBuffer[0 * plane + p] = src[s] / 255;
+            f32InputBuffer[1 * plane + p] = src[s + 1] / 255;
+            f32InputBuffer[2 * plane + p] = src[s + 2] / 255;
         }
     }
+
     return inputTensor;
 }
 
@@ -212,12 +248,15 @@ let webgpuVideoFailed = false;
 
 let _cpuPixelCheckDone = false;
 
-function toInputTensorFromVideo_CPU(video, W, H, flipH) {
+function toInputTensorFromVideo_CPU(video, W, H, transform = {}) {
     if (!_videoCanvas) {
         _videoCanvas = document.createElement("canvas");
         _videoCanvas.width = W;
         _videoCanvas.height = H;
         _videoCtx = _videoCanvas.getContext("2d", { willReadFrequently: true });
+    } else if (_videoCanvas.width !== W || _videoCanvas.height !== H) {
+        _videoCanvas.width = W;
+        _videoCanvas.height = H;
     }
 
     const vw = video.videoWidth || 640;
@@ -243,22 +282,33 @@ function toInputTensorFromVideo_CPU(video, W, H, flipH) {
         const g = imgData.data[idx + 1];
         const b = imgData.data[idx + 2];
         if (r === 0 && g === 0 && b === 0) {
-            setStatus(`CPU fallback: canvas black! readyState=${video.readyState} vid=${vw}x${vh}`);
+            setStatus(
+                `CPU fallback: canvas black! readyState=${video.readyState} vid=${vw}x${vh}`,
+            );
         } else {
-            setStatus(`CPU fallback OK: centre px r=${r} g=${g} b=${b} | vid=${vw}x${vh}`);
+            setStatus(
+                `CPU fallback OK: centre px r=${r} g=${g} b=${b} | vid=${vw}x${vh}`,
+            );
         }
     }
 
-    return toInputTensorFromImageData(imgData, flipH);
+    return toInputTensorFromImageData(imgData, transform);
 }
 
 let _bitmapCanvas = null;
 let _bitmapCtx = null;
 
-export function toInputTensorFromBitmap(bitmap, W = INPUT_W, H = INPUT_H, flipH = false) {
+export function toInputTensorFromBitmap(
+    bitmap,
+    W = INPUT_W,
+    H = INPUT_H,
+    transform = {},
+) {
     if (!_bitmapCanvas) {
         _bitmapCanvas = document.createElement("canvas");
-        _bitmapCtx = _bitmapCanvas.getContext("2d", { willReadFrequently: true });
+        _bitmapCtx = _bitmapCanvas.getContext("2d", {
+            willReadFrequently: true,
+        });
     }
     if (_bitmapCanvas.width !== W || _bitmapCanvas.height !== H) {
         _bitmapCanvas.width = W;
@@ -284,7 +334,9 @@ export function toInputTensorFromBitmap(bitmap, W = INPUT_W, H = INPUT_H, flipH 
         const cx = (W / 2) | 0;
         const cy = (H / 2) | 0;
         const i = (cy * W + cx) * 4;
-        const r = imgData.data[i], g = imgData.data[i + 1], b = imgData.data[i + 2];
+        const r = imgData.data[i],
+            g = imgData.data[i + 1],
+            b = imgData.data[i + 2];
         if (r === 0 && g === 0 && b === 0) {
             setStatus(`ImageCapture: canvas still black! bitmap=${bw}x${bh}`);
         } else {
@@ -292,7 +344,7 @@ export function toInputTensorFromBitmap(bitmap, W = INPUT_W, H = INPUT_H, flipH 
         }
     }
 
-    return toInputTensorFromImageData(imgData, flipH);
+    return toInputTensorFromImageData(imgData, transform);
 }
 
 let testReadBuffer = null;
@@ -301,21 +353,34 @@ export function toInputTensorFromVideo(
     video,
     W = INPUT_W,
     H = INPUT_H,
-    flipH = false,
+    transform = {},
 ) {
+    const flipH = !!transform.flipH;
+    const flipV = !!transform.flipV;
+    const rotationDeg = normalizeRotationDeg(transform.rotationDeg);
+
     // Automatically detect TouchDesigner's CEF environment string
-    const isCEF = typeof navigator !== "undefined" && (navigator.userAgent.indexOf("TouchDesigner") !== -1 || navigator.userAgent.indexOf("CEF") !== -1);
+    const isCEF =
+        typeof navigator !== "undefined" &&
+        (navigator.userAgent.indexOf("TouchDesigner") !== -1 ||
+            navigator.userAgent.indexOf("CEF") !== -1);
 
     // Automatically bypass WebGPU compute shader entirely if we are inside TouchDesigner CEF
     // or if a silent WebGPU failure has been detected.
-    if (isCEF || webgpuVideoFailed) {
+    if (isCEF || webgpuVideoFailed || flipV || rotationDeg !== 0) {
         if (!_didLogBypass) {
-            console.log(`CEF pipeline detected or WebGPU failed (failed=${webgpuVideoFailed}): forcing pure CPU fallback to parse video element pixels.`);
+            console.log(
+                `CEF pipeline detected or WebGPU failed (failed=${webgpuVideoFailed}): forcing pure CPU fallback to parse video element pixels.`,
+            );
             _didLogBypass = true;
         }
-        return toInputTensorFromVideo_CPU(video, W, H, flipH);
+        return toInputTensorFromVideo_CPU(video, W, H, {
+            flipH,
+            flipV,
+            rotationDeg,
+        });
     }
-    
+
     try {
         const numFloats = 3 * W * H;
 
@@ -329,7 +394,10 @@ export function toInputTensorFromVideo(
         if (!videoF32GpuBuffer) {
             videoF32GpuBuffer = device.createBuffer({
                 size: numFloats * 4,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+                usage:
+                    GPUBufferUsage.STORAGE |
+                    GPUBufferUsage.COPY_SRC |
+                    GPUBufferUsage.COPY_DST,
             });
             videoParamsBuffer = device.createBuffer({
                 size: 48,
@@ -343,7 +411,7 @@ export function toInputTensorFromVideo(
 
         const vw = video.videoWidth || 640;
         const vh = video.videoHeight || 480;
-        
+
         // For CEF, we use a custom pipeline with copyExternalImageToTexture (standard 2D texture)
         // For Chrome, we use the zero-copy importExternalTexture
         if (isCEF && !videoComputePipeline_CEF) {
@@ -382,7 +450,10 @@ export function toInputTensorFromVideo(
             `;
             videoComputePipeline_CEF = device.createComputePipeline({
                 layout: "auto",
-                compute: { module: device.createShaderModule({ code: shaderCode }), entryPoint: "main" },
+                compute: {
+                    module: device.createShaderModule({ code: shaderCode }),
+                    entryPoint: "main",
+                },
             });
         } else if (!isCEF && !videoComputePipeline) {
             const shaderCode = `
@@ -420,7 +491,10 @@ export function toInputTensorFromVideo(
             `;
             videoComputePipeline = device.createComputePipeline({
                 layout: "auto",
-                compute: { module: device.createShaderModule({ code: shaderCode }), entryPoint: "main" },
+                compute: {
+                    module: device.createShaderModule({ code: shaderCode }),
+                    entryPoint: "main",
+                },
             });
         }
 
@@ -435,10 +509,14 @@ export function toInputTensorFromVideo(
         const paramsData = new ArrayBuffer(48);
         const paramsF32 = new Float32Array(paramsData);
         const paramsU32 = new Uint32Array(paramsData);
-        paramsU32[0] = W; paramsU32[1] = H;
-        paramsF32[2] = vw; paramsF32[3] = vh;
-        paramsF32[4] = ox; paramsF32[5] = oy;
-        paramsF32[6] = dw; paramsF32[7] = dh;
+        paramsU32[0] = W;
+        paramsU32[1] = H;
+        paramsF32[2] = vw;
+        paramsF32[3] = vh;
+        paramsF32[4] = ox;
+        paramsF32[5] = oy;
+        paramsF32[6] = dw;
+        paramsF32[7] = dh;
         paramsU32[8] = flipH ? 1 : 0;
         device.queue.writeBuffer(videoParamsBuffer, 0, paramsData);
 
@@ -446,20 +524,29 @@ export function toInputTensorFromVideo(
 
         if (isCEF) {
             // CEF Path using copyExternalImageToTexture
-            if (!cefVideoTexture || cefVideoTexture.width !== vw || cefVideoTexture.height !== vh) {
+            if (
+                !cefVideoTexture ||
+                cefVideoTexture.width !== vw ||
+                cefVideoTexture.height !== vh
+            ) {
                 if (cefVideoTexture) cefVideoTexture.destroy();
                 cefVideoTexture = device.createTexture({
                     size: [vw, vh, 1],
-                    format: 'rgba8unorm',
-                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT
+                    format: "rgba8unorm",
+                    usage:
+                        GPUTextureUsage.TEXTURE_BINDING |
+                        GPUTextureUsage.COPY_DST |
+                        GPUTextureUsage.RENDER_ATTACHMENT,
                 });
             }
-            
+
             // In CEF, direct video-to-texture fails silently.
             // Draw to a 2D canvas first, then copy the canvas to the WebGPU texture.
             if (!cefVideoCanvas) {
                 cefVideoCanvas = document.createElement("canvas");
-                cefVideoCtx = cefVideoCanvas.getContext("2d", { willReadFrequently: true });
+                cefVideoCtx = cefVideoCanvas.getContext("2d", {
+                    willReadFrequently: true,
+                });
             }
             if (cefVideoCanvas.width !== vw || cefVideoCanvas.height !== vh) {
                 cefVideoCanvas.width = vw;
@@ -472,7 +559,7 @@ export function toInputTensorFromVideo(
             device.queue.copyExternalImageToTexture(
                 { source: cefVideoCanvas },
                 { texture: cefVideoTexture },
-                [vw, vh]
+                [vw, vh],
             );
 
             bindGroup = device.createBindGroup({
@@ -486,7 +573,9 @@ export function toInputTensorFromVideo(
             });
         } else {
             // Chrome standard zero-copy Path using importExternalTexture
-            const externalTexture = device.importExternalTexture({ source: video });
+            const externalTexture = device.importExternalTexture({
+                source: video,
+            });
             bindGroup = device.createBindGroup({
                 layout: videoComputePipeline.getBindGroupLayout(0),
                 entries: [
@@ -500,83 +589,111 @@ export function toInputTensorFromVideo(
 
         const commandEncoder = device.createCommandEncoder();
         const passEncoder = commandEncoder.beginComputePass();
-        passEncoder.setPipeline(isCEF ? videoComputePipeline_CEF : videoComputePipeline);
+        passEncoder.setPipeline(
+            isCEF ? videoComputePipeline_CEF : videoComputePipeline,
+        );
         passEncoder.setBindGroup(0, bindGroup);
         passEncoder.dispatchWorkgroups(Math.ceil(W / 16), Math.ceil(H / 16));
         passEncoder.end();
 
-    device.queue.submit([commandEncoder.finish()]);
+        device.queue.submit([commandEncoder.finish()]);
 
         // --- ASYNC DEBUG & SELF-HEALING: Check if the texture read successfully ---
         if (!_asyncChecked && video.currentTime > 0.5) {
-            _asyncChecked = true; 
+            _asyncChecked = true;
             if (!testReadBuffer) {
                 testReadBuffer = device.createBuffer({
                     size: 16, // 4 floats
-                    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+                    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
                 });
             }
             const readbackEncoder = device.createCommandEncoder();
             const centerIdx = Math.floor(H / 2) * W + Math.floor(W / 2);
-            readbackEncoder.copyBufferToBuffer(videoF32GpuBuffer, centerIdx * 4, testReadBuffer, 0, 16);
+            readbackEncoder.copyBufferToBuffer(
+                videoF32GpuBuffer,
+                centerIdx * 4,
+                testReadBuffer,
+                0,
+                16,
+            );
             device.queue.submit([readbackEncoder.finish()]);
 
-            testReadBuffer.mapAsync(GPUMapMode.READ).then(() => {
-                const arr = new Float32Array(testReadBuffer.getMappedRange());
-                const r = arr[0];
-                const g = arr[1];
-                const b = arr[2];
-                const a = arr[3];
-                const isAllZero = r === 0 && g === 0 && b === 0 && a === 0;
-                testReadBuffer.unmap();
-                
-                if (isAllZero) {
-                    // Double check on CPU if the video is actually black, or if it's a WebGPU silent failure
-                    const checkCanvas = document.createElement("canvas");
-                    checkCanvas.width = 10;
-                    checkCanvas.height = 10;
-                    const checkCtx = checkCanvas.getContext("2d");
-                    try {
-                        checkCtx.drawImage(video, 0, 0, 10, 10);
-                        const imgData = checkCtx.getImageData(0, 0, 10, 10);
-                        let cpuIsAllZero = true;
-                        for (let i = 0; i < imgData.data.length; i += 4) {
-                            if (imgData.data[i] !== 0 || imgData.data[i+1] !== 0 || imgData.data[i+2] !== 0) {
-                                cpuIsAllZero = false;
-                                break;
+            testReadBuffer
+                .mapAsync(GPUMapMode.READ)
+                .then(() => {
+                    const arr = new Float32Array(
+                        testReadBuffer.getMappedRange(),
+                    );
+                    const r = arr[0];
+                    const g = arr[1];
+                    const b = arr[2];
+                    const a = arr[3];
+                    const isAllZero = r === 0 && g === 0 && b === 0 && a === 0;
+                    testReadBuffer.unmap();
+
+                    if (isAllZero) {
+                        // Double check on CPU if the video is actually black, or if it's a WebGPU silent failure
+                        const checkCanvas = document.createElement("canvas");
+                        checkCanvas.width = 10;
+                        checkCanvas.height = 10;
+                        const checkCtx = checkCanvas.getContext("2d");
+                        try {
+                            checkCtx.drawImage(video, 0, 0, 10, 10);
+                            const imgData = checkCtx.getImageData(0, 0, 10, 10);
+                            let cpuIsAllZero = true;
+                            for (let i = 0; i < imgData.data.length; i += 4) {
+                                if (
+                                    imgData.data[i] !== 0 ||
+                                    imgData.data[i + 1] !== 0 ||
+                                    imgData.data[i + 2] !== 0
+                                ) {
+                                    cpuIsAllZero = false;
+                                    break;
+                                }
                             }
-                        }
-                        
-                        if (!cpuIsAllZero) {
-                            // WebGPU is silent failing! Video has content, but GPU buffer is zero.
+
+                            if (!cpuIsAllZero) {
+                                // WebGPU is silent failing! Video has content, but GPU buffer is zero.
+                                webgpuVideoFailed = true;
+                                _didLogBypass = false; // Allow printing bypass log
+                                setStatus(
+                                    `WebGPU Silent Fail => Texture is all black. Falling back to CPU frame extraction.`,
+                                );
+                                console.warn(
+                                    "WebGPU silent fail detected: Video texture is all black, but video has real pixel content. Falling back to CPU frame parsing.",
+                                );
+                            } else {
+                                // Video itself is black (e.g. camera covered or initializing). Reset check so we check again.
+                                _asyncChecked = false;
+                            }
+                        } catch (drawErr) {
+                            console.warn(
+                                "Failed to CPU check video frame during WebGPU silent fail test:",
+                                drawErr,
+                            );
+                            // If drawing fails, let's also fallback just in case
                             webgpuVideoFailed = true;
-                            _didLogBypass = false; // Allow printing bypass log
-                            setStatus(`WebGPU Silent Fail => Texture is all black. Falling back to CPU frame extraction.`);
-                            console.warn("WebGPU silent fail detected: Video texture is all black, but video has real pixel content. Falling back to CPU frame parsing.");
-                        } else {
-                            // Video itself is black (e.g. camera covered or initializing). Reset check so we check again.
-                            _asyncChecked = false;
+                            _didLogBypass = false;
+                            setStatus(
+                                `WebGPU Silent Fail => Canvas check failed. Falling back to CPU.`,
+                            );
                         }
-                    } catch (drawErr) {
-                        console.warn("Failed to CPU check video frame during WebGPU silent fail test:", drawErr);
-                        // If drawing fails, let's also fallback just in case
-                        webgpuVideoFailed = true;
-                        _didLogBypass = false;
-                        setStatus(`WebGPU Silent Fail => Canvas check failed. Falling back to CPU.`);
+                    } else {
+                        setStatus(
+                            `WebGPU Image OK! Middle Pixel: r=${r.toFixed(2)}, g=${g.toFixed(2)}`,
+                        );
                     }
-                } else {
-                    setStatus(`WebGPU Image OK! Middle Pixel: r=${r.toFixed(2)}, g=${g.toFixed(2)}`);
-                }
-            }).catch(e => {
-                setStatus("WebGPU Test readback failed: " + e.message);
-                webgpuVideoFailed = true;
-                _didLogBypass = false;
-            });
+                })
+                .catch((e) => {
+                    setStatus("WebGPU Test readback failed: " + e.message);
+                    webgpuVideoFailed = true;
+                    _didLogBypass = false;
+                });
         }
 
         // We only set the regular status if we aren't in the middle of our async test check that replaces it
         if (_asyncChecked && !testReadBuffer) {
-           setStatus(diagMsg + " | Dispatched OK.");
+            setStatus(diagMsg + " | Dispatched OK.");
         }
 
         return ort.Tensor.fromGpuBuffer(videoF32GpuBuffer, {
@@ -586,6 +703,10 @@ export function toInputTensorFromVideo(
     } catch (e) {
         const errMsg = e.message ? e.message : String(e);
         setStatus("WebGPU Fail: " + errMsg);
-        return toInputTensorFromVideo_CPU(video, W, H, flipH);
+        return toInputTensorFromVideo_CPU(video, W, H, {
+            flipH,
+            flipV,
+            rotationDeg,
+        });
     }
 }

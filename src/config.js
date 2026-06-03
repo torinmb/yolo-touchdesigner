@@ -2,6 +2,8 @@
 // This file is licensed under the GNU Affero General Public License v3.0
 // (or later), see https://github.com/torinmb/yolo-touchdesigner/blob/master/LICENSE.txt.
 
+import { normalizeRotationDeg } from "./utils/orientation.js";
+
 export const qs = new URLSearchParams(location.search);
 
 const boolish = (v, def = false) => {
@@ -62,7 +64,10 @@ export const getInt = (primaryNames, fallback, commonFallbackName) => {
 export const WS_PORT = qs.get("wsPort") || "62309";
 export const USE_BINARY = getBool(["binary"], false);
 export const USE_CPU = getBool(["cpu", "CPU"], false);
-export const DEV_MODE = getBool(["dev", "Dev", "debug", "Debug", "DEBUG"], false);
+export const DEV_MODE = getBool(
+    ["dev", "Dev", "debug", "Debug", "DEBUG"],
+    false,
+);
 
 // Stream toggles + models
 export let ENABLE_DET = getBool(
@@ -134,8 +139,18 @@ export const POSE_TRK_TTL = getInt(["Posetrkttl"], 2, "Trkttl");
 
 // Webcam options
 export const WEBCAM_LABEL = getStr(["webcamLabel"], null);
-export const FLIP_HORIZONTAL = getBool(["flipHorizontal"], true);
+export const FLIP_HORIZONTAL = USE_BINARY
+    ? false
+    : getBool(["flipHorizontal"], true);
+export const FLIP_VERTICAL = USE_BINARY
+    ? false
+    : getBool(["flipVertical"], false);
+export const WEBCAM_ROTATION_DEG = USE_BINARY
+    ? 0
+    : normalizeRotationDeg(getInt(["webcamRotation", "rotate", "rotation"], 0));
 
 // Constants
 export const INPUT_W = 640;
 export const INPUT_H = 640;
+export const WEBCAM_INPUT_W = getInt(["webcamInputW", "inputW"], INPUT_W);
+export const WEBCAM_INPUT_H = getInt(["webcamInputH", "inputH"], INPUT_H);

@@ -2,10 +2,15 @@
 // This file is licensed under the GNU Affero General Public License v3.0
 // (or later), see https://github.com/torinmb/yolo-touchdesigner/blob/master/LICENSE.txt.
 
-import { INPUT_W, INPUT_H, PERSON_SEG_ONLY, SEG_DECAY_LIMIT } from "../config.js";
+import {
+    INPUT_W,
+    INPUT_H,
+    PERSON_SEG_ONLY,
+    SEG_DECAY_LIMIT,
+} from "../config.js";
 import { iou } from "../utils/math.js";
 
-function decodeYOLO_or_OBB(tensor, thr, topk, isObb) {
+function decodeYOLO_or_OBB(tensor, thr, topk, isObb, W = INPUT_W, H = INPUT_H) {
     const d = tensor.data;
     const sh = tensor.dims;
     if (sh.length !== 3) return [];
@@ -29,8 +34,6 @@ function decodeYOLO_or_OBB(tensor, thr, topk, isObb) {
         ? (c, i) => d[c * num + i]
         : (c, i) => d[i * dim + c];
 
-    const W = INPUT_W,
-        H = INPUT_H;
     const out = [];
 
     // Indices
@@ -216,7 +219,13 @@ export function decodeYOLOv26(tensor, score_threshold, topk) {
     return out;
 }
 
-export function decodeYOLOv26OBB(tensor, score_threshold, topk) {
+export function decodeYOLOv26OBB(
+    tensor,
+    score_threshold,
+    topk,
+    W = INPUT_W,
+    H = INPUT_H,
+) {
     const data = tensor.data;
     const dims = tensor.dims;
     // Expect [1, 300, 7]
@@ -227,9 +236,6 @@ export function decodeYOLOv26OBB(tensor, score_threshold, topk) {
     const N = dims[1];
     const stride = 7;
     const out = [];
-
-    const W = INPUT_W;
-    const H = INPUT_H;
 
     for (let i = 0; i < N; i++) {
         const off = i * stride;
@@ -494,7 +500,15 @@ function initSegPipeline(device, MW, MH, MaskC) {
 let lastValidSegResult = null;
 let segMissFrames = 0;
 
-export async function decodeYOLOSeg(outs, outputNames, scoreThr, topk, device) {
+export async function decodeYOLOSeg(
+    outs,
+    outputNames,
+    scoreThr,
+    topk,
+    device,
+    inputW = INPUT_W,
+    inputH = INPUT_H,
+) {
     let detT = null,
         protoT = null;
     for (const name of outputNames) {
@@ -545,7 +559,11 @@ export async function decodeYOLOSeg(outs, outputNames, scoreThr, topk, device) {
     }
 
     if (dets.length === 0) {
-        if (SEG_DECAY_LIMIT > 0 && lastValidSegResult && segMissFrames < SEG_DECAY_LIMIT) {
+        if (
+            SEG_DECAY_LIMIT > 0 &&
+            lastValidSegResult &&
+            segMissFrames < SEG_DECAY_LIMIT
+        ) {
             segMissFrames++;
             const len = lastValidSegResult.data.length;
             const src = lastValidSegResult.data;
@@ -577,8 +595,8 @@ export async function decodeYOLOSeg(outs, outputNames, scoreThr, topk, device) {
     // Large objects (background) first, Small objects (foreground) last.
     dets.sort((a, b) => b.box[2] * b.box[3] - a.box[2] * a.box[3]);
 
-    const scaleX = INPUT_W / MW;
-    const scaleY = INPUT_H / MH;
+    const scaleX = inputW / MW;
+    const scaleY = inputH / MH;
 
     if (!device) {
         // Fallback to CPU calculation if WebGPU is unavailable

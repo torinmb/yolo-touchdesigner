@@ -2,14 +2,28 @@
 // This file is licensed under the GNU Affero General Public License v3.0
 // (or later), see https://github.com/torinmb/yolo-touchdesigner/blob/master/LICENSE.txt.
 
-import { INPUT_W, INPUT_H, FLIP_HORIZONTAL, WEBCAM_LABEL } from "../config.js";
-import { detSession, poseSession } from "../inference/onnx.js";
-import { toInputTensorFromVideo, toInputTensorFromBitmap } from "../inference/io.js";
+import {
+    FLIP_HORIZONTAL,
+    FLIP_VERTICAL,
+    qs,
+    WEBCAM_INPUT_H,
+    WEBCAM_INPUT_W,
+    WEBCAM_LABEL,
+    WEBCAM_ROTATION_DEG,
+} from "../config.js";
+import { detSession, poseSession, segSession } from "../inference/onnx.js";
+import {
+    toInputTensorFromVideo,
+    toInputTensorFromBitmap,
+} from "../inference/io.js";
 import { runInferencePipeline } from "../pipeline.js";
 import { setStatus, ensureVisibleVideo } from "../ui.js";
+import { getRotatedSize } from "../utils/orientation.js";
 
-const isCEF = typeof navigator !== "undefined" &&
-    (navigator.userAgent.indexOf("TouchDesigner") !== -1 || navigator.userAgent.indexOf("CEF") !== -1);
+const isCEF =
+    typeof navigator !== "undefined" &&
+    (navigator.userAgent.indexOf("TouchDesigner") !== -1 ||
+        navigator.userAgent.indexOf("CEF") !== -1);
 
 let rafProcessing = false;
 let prevT = 0;
@@ -18,9 +32,48 @@ let _sender = null;
 let _videoEl = null;
 let _imageCapture = null;
 
+const webcamTransform = {
+    flipH: FLIP_HORIZONTAL,
+    flipV: FLIP_VERTICAL,
+    rotationDeg: WEBCAM_ROTATION_DEG,
+};
+
+function getWebcamProcessingSize() {
+    return getRotatedSize(WEBCAM_INPUT_W, WEBCAM_INPUT_H, WEBCAM_ROTATION_DEG);
+}
+
+function getWebcamCaptureConstraints(exactId) {
+    const widthWasExplicit = qs.has("webcamInputW") || qs.has("inputW");
+    const heightWasExplicit = qs.has("webcamInputH") || qs.has("inputH");
+    const defaultCaptureSize = getRotatedSize(
+        window.innerWidth,
+        window.innerHeight,
+        WEBCAM_ROTATION_DEG,
+    );
+
+    const video = exactId ? { deviceId: { exact: exactId } } : {};
+
+    video.width = {
+        ideal: widthWasExplicit ? WEBCAM_INPUT_W : defaultCaptureSize.width,
+    };
+    video.height = {
+        ideal: heightWasExplicit ? WEBCAM_INPUT_H : defaultCaptureSize.height,
+    };
+
+    if (widthWasExplicit && heightWasExplicit && WEBCAM_INPUT_H > 0) {
+        video.aspectRatio = { ideal: WEBCAM_INPUT_W / WEBCAM_INPUT_H };
+    } else if (defaultCaptureSize.height > 0) {
+        video.aspectRatio = {
+            ideal: defaultCaptureSize.width / defaultCaptureSize.height,
+        };
+    }
+
+    return { video };
+}
+
 export function setWebSocketSender(senderFn) {
     _sender = senderFn;
-}   
+}
 
 export async function listWebcamDevices() {
     try {
@@ -61,12 +114,18 @@ async function rafLoop() {
     try {
         const frame = lastVideoMediaTime;
         let input;
+        const frameSize = getWebcamProcessingSize();
 
         if (isCEF && _imageCapture) {
             // CEF: grab frame directly from MediaStreamTrack, bypassing the broken video compositor
             try {
                 const bitmap = await _imageCapture.grabFrame();
-                input = toInputTensorFromBitmap(bitmap, INPUT_W, INPUT_H, FLIP_HORIZONTAL);
+                input = toInputTensorFromBitmap(
+                    bitmap,
+                    WEBCAM_INPUT_W,
+                    WEBCAM_INPUT_H,
+                    webcamTransform,
+                );
                 bitmap.close();
             } catch (grabErr) {
                 setStatus("ImageCapture.grabFrame failed: " + grabErr.message);
@@ -75,7 +134,12 @@ async function rafLoop() {
                 return;
             }
         } else {
-            input = toInputTensorFromVideo(_videoEl, INPUT_W, INPUT_H, FLIP_HORIZONTAL);
+            input = toInputTensorFromVideo(
+                _videoEl,
+                WEBCAM_INPUT_W,
+                WEBCAM_INPUT_H,
+                webcamTransform,
+            );
         }
 
         await runInferencePipeline(
@@ -84,6 +148,7 @@ async function rafLoop() {
             0 /* seq */,
             frame,
             _sender,
+            frameSize,
         );
 
         const now = performance.now();
@@ -108,20 +173,7 @@ export async function startWebcam() {
     const initialDevices = await listWebcamDevices();
     const exactId = findDeviceIdByLabel(initialDevices, WEBCAM_LABEL);
 
-    const constraints = exactId
-        ? {
-              video: {
-                  deviceId: { exact: exactId },
-                  width: { ideal: window.innerWidth },
-                  height: { ideal: window.innerHeight },
-              },
-          }
-        : {
-              video: {
-                  width: { ideal: window.innerWidth },
-                  height: { ideal: window.innerHeight },
-              },
-          };
+    const constraints = getWebcamCaptureConstraints(exactId);
 
     try {
         const stream = await navigator.mediaDevices.getUserMedia(constraints);

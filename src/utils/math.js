@@ -20,13 +20,13 @@ export function iou(a, b) {
     return inter / uni;
 }
 
-export function flipYKeypointsNorm(kpts, H) {
+export function flipYKeypointsNorm(kpts, W, H) {
     if (!kpts) return kpts;
-    return kpts.map((k) => ({ x: k.x / H, y: (H - k.y) / H, score: k.score }));
+    return kpts.map((k) => ({ x: k.x / W, y: (H - k.y) / H, score: k.score }));
 }
 
-export function mapBoxYFlipNorm([x, y, w, h], H) {
-    return [x / H, (H - (y + h)) / H, w / H, h / H];
+export function mapBoxYFlipNorm([x, y, w, h], W, H) {
+    return [x / W, (H - (y + h)) / H, w / W, h / H];
 }
 
 export function mapAngleToBottomLeft(angleRad) {
@@ -54,6 +54,6 @@ export function polygonFromXYWHR([x, y, w, h], angleRad) {
     return pts; // [[x1,y1],...]
 }
 
-export function normPolyYFlip(pts, H) {
-    return pts.map(([px, py]) => [px / H, (H - py) / H]);
+export function normPolyYFlip(pts, W, H) {
+    return pts.map(([px, py]) => [px / W, (H - py) / H]);
 }

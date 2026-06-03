@@ -11,11 +11,19 @@ import {
     flipYKeypointsNorm,
 } from "./math.js";
 
-export function formatPredictions(frameId, seq, keepDet, keepPose, videoFrame) {
-    const H = INPUT_H;
+export function formatPredictions(
+    frameId,
+    seq,
+    keepDet,
+    keepPose,
+    videoFrame,
+    frameSize = null,
+) {
+    const width = frameSize?.width ?? INPUT_W;
+    const height = frameSize?.height ?? INPUT_H;
 
     const predsDet = keepDet.map((t) => {
-        const box = mapBoxYFlipNorm(t.box, H);
+        const box = mapBoxYFlipNorm(t.box, width, height);
         // Use Center coordinates (cx, cy) instead of Bottom-Left (tx, ty)
         // to ensure rotation happens around the center of the object in TD.
         const out = {
@@ -33,14 +41,14 @@ export function formatPredictions(frameId, seq, keepDet, keepPose, videoFrame) {
             out.angleRad = mapAngleToBottomLeft(t.angle);
             out.angleDeg = out.angleRad * (180 / Math.PI);
             const polyImg = polygonFromXYWHR(t.box, t.angle);
-            out.polygon = normPolyYFlip(polyImg, H);
+            out.polygon = normPolyYFlip(polyImg, width, height);
         }
         return out;
     });
 
     const predsPose = keepPose.map((t) => {
-        const box = mapBoxYFlipNorm(t.box, H);
-        const kpts = flipYKeypointsNorm(t.keypoints, H);
+        const box = mapBoxYFlipNorm(t.box, width, height);
+        const kpts = flipYKeypointsNorm(t.keypoints, width, height);
         return {
             tx: box[0],
             ty: box[1],
@@ -57,8 +65,8 @@ export function formatPredictions(frameId, seq, keepDet, keepPose, videoFrame) {
         frame: frameId >>> 0,
         seq: seq >>> 0,
         videoFrame,
-        width: INPUT_W,
-        height: INPUT_H,
+        width,
+        height,
         yolo: predsDet,
         yolo_pose: predsPose,
     };

@@ -220,8 +220,10 @@ export async function initSessions(baseURL) {
     }
 }
 
-export async function runDetect(input) {
+export async function runDetect(input, frameSize = null) {
     if (!detSession) return [];
+    const inputW = frameSize?.width ?? INPUT_W;
+    const inputH = frameSize?.height ?? INPUT_H;
     const outs = await detSession.run({ [detSession.inputNames[0]]: input });
     const head = outs[detSession.outputNames[0]];
 
@@ -230,7 +232,13 @@ export async function runDetect(input) {
         if (head.dims[2] === 6) {
             return decodeYOLOv26(head, DET_SCORE_T, DET_TOPK);
         } else if (head.dims[2] === 7) {
-            return decodeYOLOv26OBB(head, DET_SCORE_T, DET_TOPK);
+            return decodeYOLOv26OBB(
+                head,
+                DET_SCORE_T,
+                DET_TOPK,
+                inputW,
+                inputH,
+            );
         }
     }
 
@@ -302,11 +310,18 @@ export async function runDetect(input) {
     }
 
     // JS Decode Path (Fallback/OBB)
-    const dets = decodeYOLO_or_OBB(head, DET_SCORE_T, DET_TOPK, IS_OBB);
+    const dets = decodeYOLO_or_OBB(
+        head,
+        DET_SCORE_T,
+        DET_TOPK,
+        IS_OBB,
+        inputW,
+        inputH,
+    );
     return nmsPerClass(dets, DET_IOU_T, DET_TOPK);
 }
 
-export async function runPose(input) {
+export async function runPose(input, frameSize = null) {
     if (!poseSession) return [];
     const outs = await poseSession.run({
         [detSession ? detSession.inputNames[0] : poseSession.inputNames[0]]:
@@ -323,14 +338,16 @@ export async function runPose(input) {
         head,
         POSE_SCORE_T,
         POSE_TOPK,
-        INPUT_W,
-        INPUT_H,
+        frameSize?.width ?? INPUT_W,
+        frameSize?.height ?? INPUT_H,
     );
     return nmsPerClass(dets, POSE_IOU_T, POSE_TOPK);
 }
 
-export async function runSeg(input) {
+export async function runSeg(input, frameSize = null) {
     if (!segSession) return null;
+    const inputHeight = input?.dims?.[2] ?? frameSize?.height ?? INPUT_H;
+    const inputWidth = input?.dims?.[3] ?? frameSize?.width ?? INPUT_W;
     const outs = await segSession.run({
         [segSession.inputNames[0]]: input,
     });
@@ -340,5 +357,7 @@ export async function runSeg(input) {
         SEG_SCORE_T,
         SEG_TOPK,
         device,
+        inputWidth,
+        inputHeight,
     );
 }
